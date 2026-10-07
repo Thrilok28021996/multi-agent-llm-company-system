@@ -2888,15 +2888,3 @@ class CompanyWorkflow:
 
     def _interactive_gate(self, *args, **kwargs):
         return _interactive_gate(self, *args, **kwargs)
-
-
-
-
-
-
-
-
-
-
-
-

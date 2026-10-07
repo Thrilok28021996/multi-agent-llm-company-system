@@ -224,5 +224,3 @@ async def _run_data_analysis_phase(workflow) -> None:
                 console.warning(f"Could not update current problem after re-ranking: {e}")
 
     console.success(f"Data analysis complete: {len(validated)} problems, {len(bias_flags)} bias flags")
-
-

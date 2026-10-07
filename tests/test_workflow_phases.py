@@ -315,7 +315,9 @@ def test_interactive_gate_aborts_when_prompt_is_skipped(monkeypatch):
 # ============================================================
 
 
-async def _run_security_review_with_fix(tmp_path, second_verdict="safe"):
+async def _run_security_review_with_fix(
+    tmp_path, second_verdict="secure", second_output=None, second_success=True
+):
     project = tmp_path / "proj"
     project.mkdir()
     source = project / "app.py"
@@ -333,9 +335,13 @@ async def _run_security_review_with_fix(tmp_path, second_verdict="safe"):
         if len(reviews) == 1:
             return task_result(
                 {"verdict": "critical_vulnerabilities", "critical_count": 1, "review": "hardcoded password"},
-                success=False,
+                success=True,
             )
-        return task_result({"verdict": second_verdict, "critical_count": 0}, success=True)
+        retry_output = (
+            second_output if second_output is not None
+            else {"verdict": second_verdict, "critical_count": 0}
+        )
+        return task_result(retry_output, success=second_success)
 
     async def developer_fix(task):
         # The developer writes the fix to disk...
@@ -361,7 +367,7 @@ async def test_security_review_rebuilds_snapshot_after_fix(tmp_path):
     assert "VULNERABLE" not in reviews[1]["files"]["app.py"]
     assert "os.environ" in reviews[1]["files"]["app.py"]
     assert reviews[0]["files"] != reviews[1]["files"]
-    assert wf.state.artifacts["security_review"] == {"verdict": "safe", "critical_count": 0}
+    assert wf.state.artifacts["security_review"] == {"verdict": "secure", "critical_count": 0}
 
 
 @pytest.mark.asyncio
@@ -384,7 +390,7 @@ async def test_security_review_passes_without_fix_round_trip(tmp_path):
     wf.state.current_problem = make_problem()
     wf.state.artifacts["project_name"] = str(project)
     wf.security_engineer.execute_task = AsyncMock(
-        return_value=task_result({"verdict": "safe", "critical_count": 0})
+        return_value=task_result({"verdict": "secure", "critical_count": 0})
     )
 
     result = await quality_phase._run_security_review_phase(wf)
@@ -392,6 +398,72 @@ async def test_security_review_passes_without_fix_round_trip(tmp_path):
     assert result is True
     wf.security_engineer.execute_task.assert_awaited_once()
     wf.developer.execute_task.assert_not_called()
+
+
+# ============================================================
+#  Security review fails closed (failed result / unknown verdict)
+# ============================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "review_output,review_success",
+    [
+        ({}, True),                       # missing verdict
+        ({"verdict": "banana"}, True),    # unknown verdict
+        ({"verdict": "secure"}, False),   # failed TaskResult claiming to be clean
+        ({}, False),                      # failed TaskResult with no output
+    ],
+)
+async def test_security_review_fails_closed_on_bad_initial_result(
+    tmp_path, review_output, review_success
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "app.py").write_text("safe = True\n")
+
+    wf = make_workflow(tmp_path)
+    wf.state.current_problem = make_problem()
+    wf.state.artifacts["project_name"] = str(project)
+    wf.security_engineer.execute_task = AsyncMock(
+        return_value=task_result(review_output, success=review_success)
+    )
+
+    result = await quality_phase._run_security_review_phase(wf)
+
+    assert result is False
+    wf.security_engineer.execute_task.assert_awaited_once()
+    wf.developer.execute_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_security_review_fails_closed_when_retry_result_fails(tmp_path):
+    result, reviews, _ = await _run_security_review_with_fix(
+        tmp_path,
+        second_output={"verdict": "secure", "critical_count": 0},
+        second_success=False,
+    )
+
+    assert result is False
+    assert len(reviews) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "second_output",
+    [
+        {},                                # missing verdict after the fix
+        {"verdict": "banana"},             # unknown verdict after the fix
+        {"verdict": "critical_vulnerabilities", "critical_count": 1},  # issues remain
+    ],
+)
+async def test_security_review_fails_closed_on_retry(tmp_path, second_output):
+    result, reviews, _ = await _run_security_review_with_fix(
+        tmp_path, second_output=second_output
+    )
+
+    assert result is False
+    assert len(reviews) == 2
 
 
 # ============================================================

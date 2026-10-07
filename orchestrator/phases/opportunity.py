@@ -160,5 +160,3 @@ Opposing Viewpoints: {opposing_summary}
             approved = False
 
     return approved
-
-

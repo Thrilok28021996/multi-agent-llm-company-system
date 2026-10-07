@@ -122,5 +122,3 @@ async def _discover_from_web_search(workflow):
     except Exception as e:
         console.warning(f"Web search research failed: {e}")
         return []
-
-

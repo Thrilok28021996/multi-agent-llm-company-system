@@ -23,6 +23,7 @@ Tools included:
 import asyncio
 import json
 import re
+import shlex
 import subprocess
 import threading
 import time
@@ -546,7 +547,15 @@ class BashTool:
         """Execute a bash command."""
         try:
             if self.safe_mode:
-                parts = command.split()
+                # shlex, not str.split(): a quoted flag such as
+                # `python3 "-c" "print(1)"` must still be recognised as -c.
+                try:
+                    parts = shlex.split(command)
+                except ValueError as e:
+                    return ToolResult(
+                        success=False,
+                        error=f"Unparseable command: {e}"
+                    )
                 base_cmd = parts[0] if parts else ""
                 if base_cmd not in self.SAFE_COMMANDS:
                     return ToolResult(

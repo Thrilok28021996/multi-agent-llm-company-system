@@ -121,5 +121,3 @@ async def _run_ceo_approval(workflow) -> bool:
             workflow.plan_manager.fail_step("step_4", error=f"CEO: {decision} - {reasoning}")
 
     return approved
-
-

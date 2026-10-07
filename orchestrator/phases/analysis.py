@@ -98,5 +98,3 @@ async def _run_analysis_phase(workflow) -> None:
     console.info(f"Problem: {problem.description}")
     final_status = validation_result.output.get('status', 'done') if isinstance(validation_result.output, dict) else 'done'
     console.success(f"Analysis complete - Validation: {final_status}")
-
-

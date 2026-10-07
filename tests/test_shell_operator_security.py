@@ -156,6 +156,43 @@ class TestBashToolShellHardening:
         assert not result.success, command
         assert "path outside workspace" in result.error
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'python3 "-c" "print(1)"',
+            "python3 '-c' 'print(1)'",
+            '"python3" -c "print(1)"',
+            'node "-e" "process.exit(0)"',
+            'python "-c" "print(1)"',
+            'node "--eval" "1"',
+        ],
+    )
+    def test_quoted_inline_code_flag_blocked(self, bash_tool, command):
+        """Quoted flags must not bypass the inline-code check (shlex, not split)."""
+        result = bash_tool.execute(command)
+        assert not result.success, command
+        assert "Blocked inline code execution" in result.error
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "hello world"',
+            "grep -E 'x|y' file.txt",
+            "find . -name '*.py'",
+            'git commit -m "fix: handle a; b"',
+        ],
+    )
+    def test_quoted_arguments_still_allowed(self, bash_tool, command):
+        # Quoting is stripped for the safety checks only — legitimate
+        # quoted arguments must keep working.
+        result = bash_tool.execute(command)
+        assert "Blocked" not in (result.error or ""), f"{command}: {result.error}"
+
+    def test_malformed_quoting_rejected_not_raised(self, bash_tool):
+        result = bash_tool.execute('echo "unclosed')
+        assert not result.success
+        assert "Unparseable" in result.error
+
     def test_cwd_outside_workspace_rejected(self, bash_tool):
         result = bash_tool.execute("pwd", cwd="/etc")
         assert not result.success

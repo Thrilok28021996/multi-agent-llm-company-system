@@ -265,6 +265,31 @@ def _build_security_review_task(workflow, project_dir) -> dict:
     }
 
 
+# Verdicts SecurityEngineer._parse_security_verdict can emit for a
+# security_review task. Anything else — a failed TaskResult, a non-dict
+# output, or a missing/unknown verdict — must fail the phase rather than
+# silently pass.
+_SECURITY_VERDICT_CRITICAL = "critical_vulnerabilities"
+_SECURITY_VERDICTS_PASS = frozenset({"secure", "has_issues"})
+
+
+def _classify_security_review(review_result) -> str:
+    """Classify a SecurityEngineer review as 'critical', 'pass' or 'failed'.
+
+    Fails closed: an unsuccessful TaskResult or a missing/unrecognized
+    verdict is reported as 'failed', never as a pass.
+    """
+    if not getattr(review_result, "success", False):
+        return "failed"
+    output = review_result.output if isinstance(review_result.output, dict) else {}
+    verdict = output.get("verdict")
+    if verdict == _SECURITY_VERDICT_CRITICAL:
+        return "critical"
+    if verdict in _SECURITY_VERDICTS_PASS:
+        return "pass"
+    return "failed"
+
+
 async def _run_security_review_phase(workflow) -> bool:
     """Security Engineer reviews the solution code for vulnerabilities."""
     workflow.state.phase = WorkflowPhase.SECURITY_REVIEW
@@ -293,14 +318,17 @@ async def _run_security_review_phase(workflow) -> bool:
             review_result.success
         )
 
-    # Parse verdict
+    # Parse verdict — an unsuccessful TaskResult or a missing/unknown
+    # verdict must fail the phase, not pass it.
     output = review_result.output if isinstance(review_result.output, dict) else {}
-    verdict = output.get("verdict", "has_issues")
+    verdict = output.get("verdict", "unknown")
     critical_count = output.get("critical_count", 0)
 
-    console.info(f"Security verdict: {verdict.upper()}, {critical_count} critical vulnerabilities")
+    console.info(f"Security verdict: {str(verdict).upper()}, {critical_count} critical vulnerabilities")
 
-    if verdict == "critical_vulnerabilities":
+    review_state = _classify_security_review(review_result)
+
+    if review_state == "critical":
         console.error("Critical security vulnerabilities found! Must be fixed before deployment.")
         # Feed security issues to Developer for fixing
         project_dir = workflow.state.artifacts.get("project_name", workflow.output_dir)
@@ -321,13 +349,20 @@ async def _run_security_review_phase(workflow) -> bool:
         review_task = _build_security_review_task(workflow, project_dir)
         review_result = await workflow.security_engineer.execute_task(review_task)
         workflow.state.artifacts["security_review"] = review_result.output
-        output = review_result.output if isinstance(review_result.output, dict) else {}
-        verdict = output.get("verdict", "has_issues")
-        if verdict == "critical_vulnerabilities":
-            return False  # Still has critical issues
-        console.success("Security issues resolved after fix")
+        if _classify_security_review(review_result) == "pass":
+            console.success("Security issues resolved after fix")
+            return True
+        console.error("Security re-review did not pass after the fix — failing closed.")
+        return False
 
-    return verdict != "critical_vulnerabilities"
+    if review_state != "pass":
+        console.error(
+            f"Security review unusable (success={getattr(review_result, 'success', False)}, "
+            f"verdict={verdict!r}) — failing closed."
+        )
+        return False
+
+    return True
 
 
 async def _check_quality_gate(workflow, phase: str) -> bool:
@@ -452,5 +487,3 @@ async def _retry_gate(workflow, phase: str, reason: str) -> bool:
         console.info("Re-running QA with clearer instructions...")
         return True
     return False
-
-

@@ -141,5 +141,3 @@ async def _run_implementation_phase(workflow) -> None:
     # Complete plan step
     if workflow.plan_manager.current_plan:
         workflow.plan_manager.complete_step("step_1", output="Implementation complete")
-
-

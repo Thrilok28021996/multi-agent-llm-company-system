@@ -135,5 +135,3 @@ async def _pivot_approach(workflow) -> None:
         outcome="pivoted",
         feedback=arch_desc
     )
-
-

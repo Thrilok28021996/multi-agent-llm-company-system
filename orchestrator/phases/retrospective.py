@@ -146,5 +146,3 @@ Error: {workflow.state.error or 'None'}
         console.info(f"Session summary saved → {summary_path}")
     except Exception as _e:
         console.warning(f"Could not save session summary: {_e}")
-
-

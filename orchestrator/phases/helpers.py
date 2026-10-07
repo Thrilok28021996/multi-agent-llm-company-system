@@ -181,5 +181,3 @@ def _interactive_gate(workflow, phase_name: str, details: str = "") -> bool:
         return False
 
     return True
-
-

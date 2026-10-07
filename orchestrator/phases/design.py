@@ -264,5 +264,3 @@ Review this architecture BEFORE implementation begins. Focus on:
         console.success("Architecture revised based on design review feedback")
     else:
         console.success("Design review passed")
-
-

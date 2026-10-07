@@ -185,5 +185,3 @@ async def _run_delivery_phase(workflow) -> Dict[str, Any]:
         workflow.plan_manager.complete_step("step_5", output=f"Delivered {len(delivery.get('files', []))} files")
 
     return delivery
-
-
