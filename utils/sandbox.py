@@ -19,6 +19,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .shell_safety import find_path_escape, find_shell_operator
+
 
 class SandboxMode(Enum):
     """Sandbox restriction levels."""
@@ -141,6 +143,17 @@ class CommandValidator:
             if pattern.search(command):
                 return False, f"Command matches blocked pattern: {pattern.pattern}"
 
+        # Shell chaining, pipes, redirection and substitution run a second
+        # command that is never inspected below — reject them whenever a
+        # filter (allowlist or standard/strict mode) is expected to apply.
+        if (
+            self.config.allowed_commands is not None
+            or self.config.mode in (SandboxMode.STANDARD, SandboxMode.STRICT)
+        ):
+            operator = find_shell_operator(command)
+            if operator:
+                return False, f"Blocked {operator}"
+
         # Check allowed commands (whitelist mode)
         if self.config.allowed_commands is not None:
             cmd_parts = shlex.split(command)
@@ -148,11 +161,27 @@ class CommandValidator:
                 base_cmd = cmd_parts[0]
                 if base_cmd not in self.config.allowed_commands:
                     return False, f"Command not in allowlist: {base_cmd}"
+                # Block inline code execution — LLM can smuggle arbitrary code
+                # through `python -c "..."` which passes the allowlist.
+                interpreters_inline = {"python", "python3", "node", "npx", "ruby", "perl", "bash", "sh"}
+                if base_cmd in interpreters_inline and len(cmd_parts) >= 2:
+                    if cmd_parts[1] in ("-c", "-e", "--eval", "-r"):
+                        return False, (
+                            f"Blocked inline code execution: {base_cmd} {cmd_parts[1]}. "
+                            "Write code to a file and execute it instead."
+                        )
 
         # Check for file path access
         is_valid, reason = self._validate_file_paths(command)
         if not is_valid:
             return False, reason
+
+        # Paths (including relative escapes) must stay inside the sandbox
+        # working directory when one is configured.
+        if self.config.working_dir:
+            escape = find_path_escape(command, Path(self.config.working_dir))
+            if escape:
+                return False, f"Blocked {escape}"
 
         return True, None
 

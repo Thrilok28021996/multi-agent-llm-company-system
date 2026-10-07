@@ -34,6 +34,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 
+from utils.shell_safety import find_path_escape, find_shell_operator, is_within_workspace
+
 # Web dependencies are optional
 HAS_WEB_DEPS = False
 try:
@@ -528,6 +530,9 @@ class BashTool:
         'black', 'ruff', 'eslint', 'prettier',
     }
 
+    # Interpreters that accept inline code — LLM can smuggle arbitrary code
+    _INTERPRETERS_INLINE = {"python", "python3", "node", "npx", "ruby", "perl", "bash", "sh"}
+
     def __init__(self, workspace_root: str = ".", safe_mode: bool = True):
         self.workspace_root = Path(workspace_root).resolve()
         self.safe_mode = safe_mode
@@ -541,14 +546,45 @@ class BashTool:
         """Execute a bash command."""
         try:
             if self.safe_mode:
-                base_cmd = command.split()[0] if command.split() else ""
+                parts = command.split()
+                base_cmd = parts[0] if parts else ""
                 if base_cmd not in self.SAFE_COMMANDS:
                     return ToolResult(
                         success=False,
                         error=f"Command '{base_cmd}' not in safe list. Disable safe_mode to run."
                     )
+                # Block inline code execution — same bypass as CommandExecutor
+                if base_cmd in self._INTERPRETERS_INLINE and len(parts) >= 2:
+                    if parts[1] in ("-c", "-e", "--eval", "-r"):
+                        return ToolResult(
+                            success=False,
+                            error=(
+                                f"Blocked inline code execution: {base_cmd} {parts[1]}. "
+                                "Write code to a file and execute it instead."
+                            )
+                        )
+                # Shell chaining, pipes, redirection and substitution run
+                # commands that never touch the allowlist.
+                operator = find_shell_operator(command)
+                if operator:
+                    return ToolResult(
+                        success=False,
+                        error=(
+                            f"Blocked {operator}. "
+                            "Run a single command per call; chaining bypasses the allowlist."
+                        )
+                    )
+                # Arguments must not point outside the configured workspace.
+                escape = find_path_escape(command, self.workspace_root)
+                if escape:
+                    return ToolResult(success=False, error=f"Blocked {escape}.")
 
             work_dir = self._resolve_path(cwd) if cwd else self.workspace_root
+            if not is_within_workspace(work_dir, self.workspace_root):
+                return ToolResult(
+                    success=False,
+                    error=f"Working directory outside workspace: {cwd}"
+                )
 
             result = subprocess.run(
                 command,
@@ -831,7 +867,7 @@ class NotebookTool:
 
             if edit_mode == "delete":
                 if cell_index < 0 or cell_index >= len(cells):
-                    return ToolResult(success=False, error=f"Cell index out of range")
+                    return ToolResult(success=False, error="Cell index out of range")
                 del cells[cell_index]
 
             elif edit_mode == "insert":
@@ -847,7 +883,7 @@ class NotebookTool:
 
             else:  # replace
                 if cell_index < 0 or cell_index >= len(cells):
-                    return ToolResult(success=False, error=f"Cell index out of range")
+                    return ToolResult(success=False, error="Cell index out of range")
                 cells[cell_index]["source"] = new_source.splitlines(keepends=True)
                 cells[cell_index]["cell_type"] = cell_type
 
@@ -894,6 +930,25 @@ class TaskTool:
 
     def run_background(self, command: str, cwd: Optional[str] = None, timeout: int = 600) -> ToolResult:
         """Run command in background."""
+        # Same hardening as BashTool: no shell chaining/substitution/redirection
+        # and no working directory outside the workspace.
+        operator = find_shell_operator(command)
+        if operator:
+            return ToolResult(success=False, error=f"Blocked {operator}.")
+        escape = find_path_escape(command, self.workspace_root)
+        if escape:
+            return ToolResult(success=False, error=f"Blocked {escape}.")
+
+        work_dir = Path(cwd) if cwd else self.workspace_root
+        if not work_dir.is_absolute():
+            work_dir = self.workspace_root / work_dir
+        work_dir = work_dir.resolve()
+        if not is_within_workspace(work_dir, self.workspace_root):
+            return ToolResult(
+                success=False,
+                error=f"Working directory outside workspace: {cwd}"
+            )
+
         with self._lock:
             self._counter += 1
             task_id = f"task_{self._counter}"
@@ -901,7 +956,6 @@ class TaskTool:
         task = BackgroundTask(task_id=task_id, command=command)
         self.tasks[task_id] = task
 
-        work_dir = Path(cwd).resolve() if cwd else self.workspace_root
         self.executor.submit(self._execute, task, work_dir, timeout)
 
         return ToolResult(success=True, data={"task_id": task_id, "status": "running"})

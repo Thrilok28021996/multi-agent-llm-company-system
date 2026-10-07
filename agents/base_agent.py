@@ -454,21 +454,24 @@ First Principles Analysis:
             {"role": "user", "content": thinking_prompt}
         ]
 
+        # Store original settings so we can restore them even on failure
+        original_temp = self.config.temperature
+        original_max_tokens = self.config.max_tokens
+
         try:
-            # Store original temperature, use lower for analytical thinking
-            original_temp = self.config.temperature
+            # Use lower temperature for analytical thinking
             self.config.temperature = 0.3
-            original_max_tokens = self.config.max_tokens
             self.config.max_tokens = max(original_max_tokens, 2048)
 
             thinking = self._call_llm_with_retry(messages, max_retries=2)
 
-            # Restore original settings
+        except LLMError as e:
+            console.warning(f"[{self.name}] think() failed: {e}")
+            thinking = ""
+        finally:
+            # Always restore — prevents stale temperature leaking into subsequent calls
             self.config.temperature = original_temp
             self.config.max_tokens = original_max_tokens
-
-        except LLMError as e:
-            thinking = f"[Unable to think - {str(e)}]"
 
         # Record the thinking in memory
         self.memory.add_to_conversation("user", f"[THINKING] {problem}")
@@ -1038,6 +1041,55 @@ COGNITIVE DISCIPLINE:
 
         raise last_exception or LLMError("Unknown error occurred")
 
+    async def _call_llm_with_retry_async(
+        self,
+        messages: List[Dict[str, str]],
+        max_retries: int = 3,
+    ) -> str:
+        """Async version of _call_llm_with_retry — uses asyncio.sleep for non-blocking retries."""
+        last_exception = None
+
+        if not self.model_spec:
+            raise LLMModelNotFoundError(f"No model spec found for role: {self.role}")
+
+        messages = self._trim_messages_to_budget(messages)
+
+        for attempt in range(max_retries + 1):
+            try:
+                t0 = time.time()
+                text, input_tokens, output_tokens = await get_llm_client().chat_async(
+                    self.model_spec,
+                    messages,
+                    temperature=self.config.temperature,
+                    max_tokens=self.config.max_tokens,
+                )
+                if input_tokens or output_tokens:
+                    track_usage(
+                        model=self.model_spec.name,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        agent=self.name,
+                        operation="chat_async",
+                        duration_ms=(time.time() - t0) * 1000,
+                    )
+                return console._clean_llm_output(text)
+
+            except FileNotFoundError as e:
+                raise LLMModelNotFoundError(str(e))
+            except ConnectionError as e:
+                last_exception = LLMConnectionError(f"Connection error: {e}")
+            except TimeoutError as e:
+                last_exception = LLMTimeoutError(f"Request timed out: {e}")
+            except Exception as e:
+                last_exception = LLMError(f"Unexpected error: {e}")
+
+            if attempt < max_retries:
+                delay = min(1.0 * (2 ** attempt) * (0.5 + random.random()), 30.0)
+                console.warning(f"Retry {attempt + 1}/{max_retries} after {delay:.1f}s...")
+                await asyncio.sleep(delay)
+
+        raise last_exception or LLMError("Unknown error occurred")
+
     def _generate_streaming(
         self,
         messages: List[Dict[str, str]],
@@ -1077,22 +1129,13 @@ COGNITIVE DISCIPLINE:
             raise LLMError(f"Streaming error: {e}")
 
     def _clean_llm_output(self, text: str) -> str:
-        """Clean LLM output by removing thinking tags and artifacts."""
-        if not text:
-            return ""
+        """Clean LLM output by removing thinking tags and artifacts.
 
-        # Strip Qwen3 native thinking blocks entirely (content + tags)
-        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-        text = re.sub(r'<think>.*', '', text, flags=re.DOTALL)  # unclosed tag
-
-        # Remove other common artifacts
-        text = re.sub(r'<\/?begin.*?>', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'<\/?end.*?>', '', text, flags=re.IGNORECASE)
-
-        # Clean up excess whitespace
-        text = re.sub(r'\n{3,}', '\n\n', text)
-
-        return text.strip()
+        Delegates to llm_client._clean_text which handles all known
+        tag formats (Qwen3 think, generic thinking/reasoning/analysis, etc.).
+        """
+        from config.llm_client import _clean_text
+        return _clean_text(text)
 
     @abstractmethod
     async def execute_task(self, task: Dict[str, Any]) -> TaskResult:
@@ -1371,7 +1414,7 @@ Messages Pending: {status['inbox_count']} in, {status['outbox_count']} out
         streaming: bool = False,
         stream_callback: Optional[Callable[[str], None]] = None
     ) -> str:
-        """Async version of generate_response — rate-limited to avoid overwhelming LM Studio."""
+        """Async version of generate_response — non-blocking retries via asyncio.sleep."""
         async with _LLM_SEMAPHORE:
             return await asyncio.to_thread(
                 self.generate_response, prompt, context, use_first_principles,
