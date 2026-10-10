@@ -375,6 +375,104 @@ class TestAllowedCommandsRegression:
         assert "Blocked" not in (result.error or "")
 
 
+# ============================================================
+#  F1 regression: the code-flag scan stops at the -m boundary
+# ============================================================
+
+# Once the command is `python3 -m <tool> ...`, every later argument belongs
+# to <tool>: pytest's -c/-r and pip's -e/-c are the tool's own flags, not
+# python's inline-code flags. All of these were allowed at base 63c859d and
+# must be allowed at every gate again.
+MODULE_FLAG_ALLOWED = [
+    "python3 -m pytest -c pytest.ini",
+    "python3 -m pytest -r a",
+    "python3 -m pip install -c constraints.txt",
+    "python3 -m pip install -e .",
+    'python3 -m pip install -e ".[dev]"',
+    "python -m pytest",
+    "python3 -m http.server",
+    "python3 -m pytest -q",
+    "python3 -m pytest -v",
+]
+
+# A code flag BEFORE the -m boundary is still the interpreter's own flag
+# (python has not handed over to a module yet) — these stay blocked.
+CODE_FLAG_BEFORE_M = [
+    "python3 -c 'print(1)' -m pytest",
+    "python3 -O -c 'print(1)' -m pytest",
+]
+
+
+class TestModuleFlagBoundary:
+    """F1: ``python3 -m <tool> ...`` must not be read as inline code.
+
+    The ``-m`` boundary is applied identically at all four gates:
+    CommandExecutor._is_command_safe, BashTool.execute,
+    TaskTool.run_background and the sandbox CommandValidator.validate.
+    """
+
+    @pytest.mark.parametrize("command", MODULE_FLAG_ALLOWED)
+    def test_module_flag_command_allowed_by_all_entry_points(
+        self, command, executor, bash_tool, sandbox_validator, task_tool, monkeypatch
+    ):
+        # Gate 1 — CommandExecutor
+        is_safe, reason = executor._is_command_safe(command)
+        assert is_safe, f"CommandExecutor rejected {command}: {reason}"
+
+        # Gate 2 — sandbox CommandValidator
+        is_valid, reason = sandbox_validator.validate(command)
+        assert is_valid, f"CommandValidator rejected {command}: {reason}"
+
+        # Gate 3 — BashTool (subprocess stubbed: only the safety layer runs)
+        class _Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        monkeypatch.setattr(
+            "tools.unified_tools.subprocess.run",
+            lambda *args, **kwargs: _Completed(),
+        )
+        result = bash_tool.execute(command)
+        assert result.success, f"BashTool rejected {command}: {result.error}"
+        assert "Blocked" not in (result.error or "")
+
+        # Gate 4 — TaskTool (background runner stubbed: nothing is spawned,
+        # only the gate that rejects/accepts the command is under test)
+        monkeypatch.setattr(
+            TaskTool,
+            "_execute",
+            lambda self, task, work_dir, timeout: None,
+        )
+        result = task_tool.run_background(command)
+        assert result.success, f"TaskTool rejected {command}: {result.error}"
+        assert "Blocked" not in (result.error or "")
+
+    @pytest.mark.parametrize("command", CODE_FLAG_BEFORE_M)
+    def test_code_flag_before_m_blocked_by_all_entry_points(
+        self, command, executor, bash_tool, sandbox_validator, task_tool
+    ):
+        # Gate 1 — CommandExecutor
+        is_safe, reason = executor._is_command_safe(command)
+        assert not is_safe, f"CommandExecutor allowed: {command}"
+        assert "inline code execution" in reason.lower()
+
+        # Gate 2 — sandbox CommandValidator
+        is_valid, reason = sandbox_validator.validate(command)
+        assert not is_valid, f"CommandValidator allowed: {command}"
+        assert reason and "inline code execution" in reason
+
+        # Gate 3 — BashTool
+        result = bash_tool.execute(command)
+        assert not result.success, f"BashTool allowed: {command}"
+        assert "Blocked inline code execution" in (result.error or "")
+
+        # Gate 4 — TaskTool (rejected before anything is spawned)
+        result = task_tool.run_background(command)
+        assert not result.success, f"TaskTool allowed: {command}"
+        assert "Blocked inline code execution" in (result.error or "")
+
+
 def _readme_module_paths(text: str) -> set:
     """Module paths referenced by README.md.
 

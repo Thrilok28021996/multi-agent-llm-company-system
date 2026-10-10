@@ -524,13 +524,24 @@ _INLINE_CODE_FLAGS = ("-c", "-e", "--eval", "-r")
 def _find_inline_code_flag(args: List[str]) -> Optional[str]:
     """Return the inline-code flag found in ``args``, or ``None``.
 
-    The code-flag family is rejected wherever it appears in the argument
-    vector (``python3 -O -c ...``, ``python3 -X importtime -c ...``), in
-    ``--flag=value`` spelling (``node --eval=<code>``), and attached to its
-    payload (``python3 -c"<code>"`` leaves ``-c<code>`` in a single token
+    ``args`` must be the interpreter's own arguments. Scanning stops at
+    the ``-m <module>`` boundary: everything after ``-m`` belongs to the
+    module's argument vector, not to the interpreter, so
+    ``python3 -m pytest -c pytest.ini`` and ``python3 -m pip install -e .``
+    are module flags, not inline-code flags. A code flag appearing
+    before ``-m`` is still rejected (``python3 -c '<code>' -m pytest``).
+
+    Within the interpreter's own arguments, the code-flag family is
+    rejected wherever it appears (``python3 -O -c ...``,
+    ``python3 -X importtime -c ...``), in ``--flag=value`` spelling
+    (``node --eval=<code>``), and attached to its payload
+    (``python3 -c"<code>"`` leaves ``-c<code>`` in a single token
     after ``shlex.split``; likewise ``perl -e'<code>'``).
     """
     for arg in args:
+        if arg == "-m":
+            # Module boundary: the rest of the argv is the module's.
+            return None
         if arg in _INLINE_CODE_FLAGS:
             return arg
         if arg.startswith("--eval="):
@@ -589,9 +600,11 @@ class BashTool:
                         error=f"Command '{base_cmd}' not in safe list. Disable safe_mode to run."
                     )
                 # Block inline code execution — same bypass as CommandExecutor.
-                # The flag is rejected wherever it appears in the argument
-                # vector (not only at parts[1]), in `--flag=value` spelling,
-                # and when attached to its payload as a single token.
+                # The flag is rejected wherever it appears in the interpreter's
+                # own arguments (not only at parts[1]), in `--flag=value`
+                # spelling, and when attached to its payload as a single token.
+                # The scan stops at the `-m <module>` boundary: after `-m` the
+                # arguments belong to the module (`python3 -m pip install -e .`).
                 if base_cmd in self._INTERPRETERS_INLINE:
                     inline_flag = _find_inline_code_flag(parts[1:])
                     if inline_flag:
@@ -974,7 +987,9 @@ class TaskTool:
         """Run command in background."""
         # Inline-code hardening, same rule as BashTool: interpreters must run
         # files or modules, never a -c/-e/--eval payload, wherever the flag
-        # appears in the argument vector.
+        # appears in the interpreter's own arguments. The scan stops at the
+        # `-m <module>` boundary — after `-m` the flags belong to the module
+        # (`python3 -m pytest -r a`).
         try:
             parts = shlex.split(command)
         except ValueError:
