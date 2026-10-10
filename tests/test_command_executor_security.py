@@ -77,6 +77,23 @@ class TestInlineCodeExecutionBlocked:
         is_safe, reason = unsafe_executor._is_command_safe("python -c 'print(1)'")
         assert is_safe
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "python3 -O -c 'print(1)'",
+            "python3 -X importtime -c 'print(1)'",
+            "node --eval=process.exit(0)",
+            'python3 -c"print(1)"',
+        ],
+    )
+    def test_flag_bypass_forms_blocked(self, executor, command):
+        """The code-flag family is rejected wherever it appears: after other
+        flags (`-O`, `-X importtime`), in `--flag=value` spelling, and
+        attached to its payload as one shlex token."""
+        is_safe, reason = executor._is_command_safe(command)
+        assert not is_safe, command
+        assert "inline code execution" in reason.lower()
+
     def test_node_e_flag_blocked(self, executor):
         """node -e 'require(...)' must be blocked."""
         is_safe, reason = executor._is_command_safe("node -e 'require(\"child_process\").exec(\"ls\")'")

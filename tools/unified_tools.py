@@ -516,6 +516,32 @@ class GrepTool:
 #  BASH TOOL
 # ============================================================
 
+# Inline-code flag spellings accepted by the interpreters in
+# ``BashTool._INTERPRETERS_INLINE`` / ``TaskTool._INTERPRETERS_INLINE``.
+_INLINE_CODE_FLAGS = ("-c", "-e", "--eval", "-r")
+
+
+def _find_inline_code_flag(args: List[str]) -> Optional[str]:
+    """Return the inline-code flag found in ``args``, or ``None``.
+
+    The code-flag family is rejected wherever it appears in the argument
+    vector (``python3 -O -c ...``, ``python3 -X importtime -c ...``), in
+    ``--flag=value`` spelling (``node --eval=<code>``), and attached to its
+    payload (``python3 -c"<code>"`` leaves ``-c<code>`` in a single token
+    after ``shlex.split``; likewise ``perl -e'<code>'``).
+    """
+    for arg in args:
+        if arg in _INLINE_CODE_FLAGS:
+            return arg
+        if arg.startswith("--eval="):
+            return "--eval=..."
+        if arg.startswith("-c") and len(arg) > 2:
+            return "-c..."
+        if arg.startswith("-e") and len(arg) > 2:
+            return "-e..."
+    return None
+
+
 class BashTool:
     """Safe bash command execution with allowlist."""
 
@@ -562,13 +588,17 @@ class BashTool:
                         success=False,
                         error=f"Command '{base_cmd}' not in safe list. Disable safe_mode to run."
                     )
-                # Block inline code execution — same bypass as CommandExecutor
-                if base_cmd in self._INTERPRETERS_INLINE and len(parts) >= 2:
-                    if parts[1] in ("-c", "-e", "--eval", "-r"):
+                # Block inline code execution — same bypass as CommandExecutor.
+                # The flag is rejected wherever it appears in the argument
+                # vector (not only at parts[1]), in `--flag=value` spelling,
+                # and when attached to its payload as a single token.
+                if base_cmd in self._INTERPRETERS_INLINE:
+                    inline_flag = _find_inline_code_flag(parts[1:])
+                    if inline_flag:
                         return ToolResult(
                             success=False,
                             error=(
-                                f"Blocked inline code execution: {base_cmd} {parts[1]}. "
+                                f"Blocked inline code execution: {base_cmd} {inline_flag}. "
                                 "Write code to a file and execute it instead."
                             )
                         )
@@ -930,6 +960,9 @@ class BackgroundTask:
 class TaskTool:
     """Background task execution."""
 
+    # Interpreters that accept inline code — LLM can smuggle arbitrary code
+    _INTERPRETERS_INLINE = {"python", "python3", "node", "npx", "ruby", "perl", "bash", "sh"}
+
     def __init__(self, workspace_root: str = "."):
         self.workspace_root = Path(workspace_root).resolve()
         self.tasks: Dict[str, BackgroundTask] = {}
@@ -939,6 +972,38 @@ class TaskTool:
 
     def run_background(self, command: str, cwd: Optional[str] = None, timeout: int = 600) -> ToolResult:
         """Run command in background."""
+        # Inline-code hardening, same rule as BashTool: interpreters must run
+        # files or modules, never a -c/-e/--eval payload, wherever the flag
+        # appears in the argument vector.
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            # Broken quoting: fall back to the raw first token so an
+            # interpreter command cannot slip through unexamined, while
+            # non-interpreter commands keep their existing behaviour.
+            raw_first = command.lstrip().split(None, 1)
+            first = raw_first[0].strip("\"'").rsplit("/", 1)[-1] if raw_first else ""
+            if first in self._INTERPRETERS_INLINE:
+                return ToolResult(
+                    success=False,
+                    error=(
+                        f"Blocked inline code execution: {first} (unparseable command). "
+                        "Write code to a file and execute it instead."
+                    ),
+                )
+            parts = []
+        if parts:
+            base_cmd = parts[0].rsplit("/", 1)[-1] if "/" in parts[0] else parts[0]
+            if base_cmd in self._INTERPRETERS_INLINE:
+                inline_flag = _find_inline_code_flag(parts[1:])
+                if inline_flag:
+                    return ToolResult(
+                        success=False,
+                        error=(
+                            f"Blocked inline code execution: {base_cmd} {inline_flag}. "
+                            "Write code to a file and execute it instead."
+                        ),
+                    )
         # Same hardening as BashTool: no shell chaining/substitution/redirection
         # and no working directory outside the workspace.
         operator = find_shell_operator(command)

@@ -5,6 +5,7 @@ and the sandbox ``CommandValidator`` (SandboxValidator). Simple approved
 commands must keep working.
 """
 
+import re
 import sys
 from pathlib import Path
 
@@ -241,7 +242,10 @@ class TestTaskToolShellHardening:
 def sandbox_validator(tmp_path):
     config = SandboxConfig(
         mode=SandboxMode.STANDARD,
-        allowed_commands=["ls", "cat", "echo", "grep", "python3"],
+        allowed_commands=[
+            "ls", "cat", "echo", "grep", "find", "head",
+            "python", "python3", "node", "pip", "git",
+        ],
         working_dir=str(tmp_path),
     )
     return CommandValidator(config)
@@ -283,3 +287,159 @@ class TestSandboxValidatorShellHardening:
         config = SandboxConfig(mode=SandboxMode.DISABLED)
         validator = CommandValidator(config)
         assert validator.validate("anything ; goes") == (True, None)
+
+
+# ============================================================
+#  Inline-code flag bypasses (AC1/AC2) and README paths (AC5)
+# ============================================================
+
+# The four bypass forms: the code-flag family must be rejected wherever it
+# appears in the argument vector (not only at parts[1]), in `--flag=value`
+# spelling, and attached to its payload as a single token after shlex.split.
+BYPASS_INLINE = [
+    "python3 -O -c 'print(1)'",
+    "python3 -X importtime -c 'print(1)'",
+    "node --eval=process.exit(0)",
+    'python3 -c"print(1)"',
+]
+
+# Regression: ordinary commands must keep passing every gate.
+ALLOWED_COMMANDS = [
+    "python script.py",
+    "python -m pytest",
+    "pip install requests",
+    "ls -la",
+    "cat file.txt",
+    "grep -r pattern .",
+    'git commit -m "a; b"',
+    "grep -E 'x|y'",
+]
+
+README = Path(__file__).resolve().parent.parent / "README.md"
+
+
+class TestInlineCodeFlagBypasses:
+    """Each verified bypass form must be reported unsafe by CommandExecutor,
+    BashTool and the sandbox CommandValidator while safe mode / an allowlist
+    applies, and by TaskTool.run_background (which has no allowlist)."""
+
+    @pytest.mark.parametrize("command", BYPASS_INLINE)
+    def test_bypass_blocked_by_all_entry_points(
+        self, command, executor, bash_tool, sandbox_validator
+    ):
+        is_safe, reason = executor._is_command_safe(command)
+        assert not is_safe, f"CommandExecutor allowed: {command}"
+        assert "inline code execution" in reason.lower()
+
+        result = bash_tool.execute(command)
+        assert not result.success, f"BashTool allowed: {command}"
+        assert "Blocked inline code execution" in (result.error or "")
+
+        is_valid, reason = sandbox_validator.validate(command)
+        assert not is_valid, f"CommandValidator allowed: {command}"
+        assert reason and "inline code execution" in reason
+
+    @pytest.mark.parametrize("command", BYPASS_INLINE)
+    def test_bypass_blocked_in_task_tool(self, command, task_tool):
+        result = task_tool.run_background(command)
+        assert not result.success, f"TaskTool allowed: {command}"
+        assert "Blocked inline code execution" in (result.error or "")
+
+
+class TestAllowedCommandsRegression:
+    """AC2: legitimate commands must keep passing every gate."""
+
+    @pytest.mark.parametrize("command", ALLOWED_COMMANDS)
+    def test_allowed_by_all_entry_points(
+        self, command, executor, bash_tool, sandbox_validator, monkeypatch
+    ):
+        is_safe, reason = executor._is_command_safe(command)
+        assert is_safe, f"CommandExecutor rejected {command}: {reason}"
+
+        is_valid, reason = sandbox_validator.validate(command)
+        assert is_valid, f"CommandValidator rejected {command}: {reason}"
+
+        # Stub the subprocess so the test never runs pip/git/pytest for real —
+        # only the safety layer is under test here.
+        class _Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        monkeypatch.setattr(
+            "tools.unified_tools.subprocess.run",
+            lambda *args, **kwargs: _Completed(),
+        )
+        result = bash_tool.execute(command)
+        assert result.success, f"BashTool rejected {command}: {result.error}"
+        assert "Blocked" not in (result.error or "")
+
+
+def _readme_module_paths(text: str) -> set:
+    """Module paths referenced by README.md.
+
+    Sources: every directory-qualified ``*.py`` path in the file, every
+    backticked code span (``orchestrator/workflow.py``, ``python main.py``),
+    and the Project Structure tree, where bare entries such as
+    ``base_agent.py`` resolve against the top-level folder they hang from.
+    """
+    paths = set()
+
+    # Directory-qualified module paths, anywhere in the file.
+    paths.update(re.findall(r"[\w-]+/[\w./-]+\.py", text))
+
+    # Backticked code spans (inline spans only — fenced blocks have none).
+    for span in re.findall(r"`[^`\n]+`", text):
+        paths.update(re.findall(r"[\w./-]+\.py", span))
+
+    # Project Structure tree block.
+    marker = text.find("## Project Structure")
+    if marker == -1:
+        return paths
+    block = text[marker:]
+    fence = block.find("```")
+    if fence == -1:
+        return paths
+    block = block[fence + 3:]
+    end = block.find("```")
+    if end != -1:
+        block = block[:end]
+
+    top = None
+    for line in block.splitlines():
+        match = re.match(r"^((?:│   )*)(?:├──|└──) (.+)$", line)
+        if not match:
+            continue
+        depth = len(match.group(1)) // 4
+        entry = match.group(2).split("#", 1)[0].strip()
+        if depth == 0:
+            if "/" in entry:
+                top = entry.rstrip("/")
+            else:
+                paths.update(re.findall(r"[\w./-]+\.py", entry))
+        elif top:
+            paths.update(
+                f"{top}/{name}" for name in re.findall(r"[\w.-]+\.py", entry)
+            )
+    return paths
+
+
+class TestReadmeModuleReferences:
+    """AC5: README.md must not reference a module path that does not exist."""
+
+    def test_readme_module_paths_exist(self):
+        text = README.read_text(encoding="utf-8")
+        missing = sorted(
+            path
+            for path in _readme_module_paths(text)
+            if not (README.parent / path).exists()
+        )
+        assert not missing, f"README references missing modules: {missing}"
+
+    def test_readme_has_no_stale_usage_tracker_reference(self):
+        # README used to document a usage tracker under utils/ — that module
+        # (utils/usage_tracker.py) never existed; the real module is
+        # utils/cost_tracker.py.
+        text = README.read_text(encoding="utf-8")
+        assert "usage_tracker" not in text
+        assert "usage tracker" not in text.lower()

@@ -11,8 +11,8 @@ This script tests:
 import sys
 from pathlib import Path
 
-# Add project root to path
-project_root = Path(__file__).parent
+# Add project root to path (this script lives in scripts/)
+project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
 from agents.developer import DeveloperAgent
@@ -152,14 +152,14 @@ def test_problem_refinement(agents):
         try:
             # Check if agent has problem_refiner
             if not hasattr(agent, 'problem_refiner'):
-                console.error(f"  ❌ Agent does not have problem_refiner attribute")
+                console.error("  ❌ Agent does not have problem_refiner attribute")
                 all_passed = False
                 continue
 
             # Test refinement
             refined = agent.problem_refiner.refine(vague_problem)
 
-            console.success(f"  ✓ Problem refiner available")
+            console.success("  ✓ Problem refiner available")
             console.info(f"  Original: {vague_problem}")
             console.info(f"  Refined: {refined.refined_statement}")
             console.info(f"  Type: {refined.problem_type.value}")
@@ -194,7 +194,7 @@ def test_developer_tools():
         # Test 2: Read file
         console.info("\n[Test 4.2] Testing read_file...")
         if py_files:
-            content = agent.read_file(py_files[0], limit=5)
+            agent.read_file(py_files[0], limit=5)
             console.success(f"  ✓ Read first 5 lines from {py_files[0]}")
 
         # Test 3: File exists
@@ -206,7 +206,7 @@ def test_developer_tools():
         console.info("\n[Test 4.4] Testing refine_problem_statement...")
         if hasattr(agent, 'refine_problem_statement'):
             refined = agent.refine_problem_statement("Users can't login")
-            console.success(f"  ✓ Problem refined successfully")
+            console.success("  ✓ Problem refined successfully")
             console.info(f"  Refined statement preview:\n{refined}")
         else:
             console.warning("  ⚠ refine_problem_statement method not found")
@@ -230,7 +230,7 @@ def test_complete_workflow():
     try:
         # Step 1: Researcher discovers problem
         console.info("\n[Step 1] Researcher discovers vague problem...")
-        researcher = ResearcherAgent(workspace_root=".")
+        ResearcherAgent(workspace_root=".")
         vague_problem = "Users complain that data export takes too long"
         console.info(f"  Original problem: {vague_problem}")
 
@@ -240,7 +240,7 @@ def test_complete_workflow():
         refined = pm.problem_refiner.refine(vague_problem)
         console.success(f"  ✓ Refined: {refined.refined_statement}")
         console.info(f"  Type: {refined.problem_type.value}")
-        console.info(f"  Severity: Critical" if "performance" in refined.problem_type.value else "  Severity: High")
+        console.info("  Severity: Critical" if "performance" in refined.problem_type.value else "  Severity: High")
 
         # Step 3: CTO assesses feasibility
         console.info("\n[Step 3] CTO validates problem is solvable...")
@@ -456,7 +456,7 @@ def test_learning_system():
 
             # Check persistence
             learning2 = AgentLearning(agent_name="developer", persist_dir=tmpdir)
-            advice2 = learning2.get_advice_for_task("implement_feature", "implement a feature")
+            learning2.get_advice_for_task("implement_feature", "implement a feature")
             console.success("  ✓ Lessons persist across instances")
 
             console.success("\nLEARNING SYSTEM TESTS PASSED")
@@ -580,7 +580,7 @@ def main():
         return True
     else:
         console.error("\n❌ SOME TESTS FAILED")
-        console.error(f"Please review the failures above.\n")
+        console.error("Please review the failures above.\n")
         return False
 
 

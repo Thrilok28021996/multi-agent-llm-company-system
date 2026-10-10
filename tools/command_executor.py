@@ -11,6 +11,31 @@ import asyncio
 
 from utils.shell_safety import find_path_escape, find_shell_operator, is_within_workspace
 
+# Inline-code flag spellings accepted by the interpreters in
+# ``CommandExecutor._INTERPRETERS_INLINE``.
+_INLINE_CODE_FLAGS = ("-c", "-e", "--eval", "-r")
+
+
+def _find_inline_code_flag(args: List[str]) -> Optional[str]:
+    """Return the inline-code flag found in ``args``, or ``None``.
+
+    The code-flag family is rejected wherever it appears in the argument
+    vector (``python3 -O -c ...``, ``python3 -X importtime -c ...``), in
+    ``--flag=value`` spelling (``node --eval=<code>``), and attached to its
+    payload (``python3 -c"<code>"`` leaves ``-c<code>`` in a single token
+    after ``shlex.split``; likewise ``perl -e'<code>'``).
+    """
+    for arg in args:
+        if arg in _INLINE_CODE_FLAGS:
+            return arg
+        if arg.startswith("--eval="):
+            return "--eval=..."
+        if arg.startswith("-c") and len(arg) > 2:
+            return "-c..."
+        if arg.startswith("-e") and len(arg) > 2:
+            return "-e..."
+    return None
+
 
 @dataclass
 class CommandResult:
@@ -110,10 +135,14 @@ class CommandExecutor:
 
             # Block inline code execution — LLM can smuggle arbitrary code through
             # `python -c "import os; os.system(...)"` which passes the allowlist.
-            if base_cmd in self._INTERPRETERS_INLINE and len(parts) >= 2:
-                if parts[1] in ("-c", "-e", "--eval", "-r"):
+            # The flag is rejected wherever it appears in the argument vector
+            # (not only at parts[1]), in `--flag=value` spelling, and when
+            # attached to its payload as a single token.
+            if base_cmd in self._INTERPRETERS_INLINE:
+                inline_flag = _find_inline_code_flag(parts[1:])
+                if inline_flag:
                     return False, (
-                        f"Blocked inline code execution: {base_cmd} {parts[1]}. "
+                        f"Blocked inline code execution: {base_cmd} {inline_flag}. "
                         "Write code to a file and execute it instead."
                     )
 

@@ -170,7 +170,7 @@ class ImportChecker:
                             self.warnings.append(
                                 f"⚠️  Potentially unused import '{name}' in {file_path}:{line_no}"
                             )
-            except Exception as e:
+            except Exception:
                 pass  # Skip files with parsing errors (already reported)
 
     def report(self):

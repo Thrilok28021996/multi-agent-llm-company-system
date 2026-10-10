@@ -111,34 +111,47 @@ Most single-agent and naive multi-agent systems suffer from the same structural 
 | **Memory** | Local TF-IDF RAG · session memory · shared context · cross-session learning |
 | **Web Research** | BeautifulSoup4 · async scraper · credibility scorer · cross-validator |
 | **Tools** | LSP integration · git tools · code formatter · test runner (13-tool mixin) |
-| **Logging** | Structured JSON logs · usage tracker · progress tracker · health checker |
+| **Logging** | Structured JSON logs · cost tracker · progress tracker · health checker |
 | **UI** | Rich terminal · streaming output · interactive conversational mode |
 
 ---
 
 ## Quick Start
 
-**Requirements:** Python 3.10+, [LM Studio](https://lmstudio.ai) or [Ollama](https://ollama.ai)
+**Requirements:** Python >= 3.10, [LM Studio](https://lmstudio.ai) or [Ollama](https://ollama.ai)
 
 ```bash
 # 1. Clone
 git clone https://github.com/Thrilok28021996/multi-agent-llm-company-system.git
 cd multi-agent-llm-company-system
 
-# 2. Install dependencies
+# 2. Create and activate a virtual environment (the project requires
+#    Python >= 3.10 — pyproject.toml declares requires-python = ">=3.10")
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+python -m pip install --upgrade pip
+python --version                 # must print 3.10 or newer
+
+# 3. Install dependencies (same version constraints on every machine)
 pip install -r requirements.txt
+# Development/test dependencies only — identical set to the dev section of
+# requirements.txt (pytest>=7.0.0, pytest-asyncio>=0.21.0):
+# pip install -e ".[dev]"
 
 # Optional: install as a CLI command
 pip install -e .
 # Then use: multi-agent-llm-company-system "Build a CLI tool..."
 
-# 3. Configure
+# 4. Configure
 cp .env.example .env
 # Edit .env — set LLM_BACKEND and model IDs for your setup
 
-# 4. Run with a problem statement
+# 5. Run with a problem statement
 python main.py "Build a CLI tool to monitor system resources"
 ```
+
+Run all development commands (`python -m pytest`, `ruff`, the checks in
+`scripts/`) from the repository root with the virtual environment activated.
 
 Output lands in `output/solutions/solution_<timestamp>/`
 
@@ -337,10 +350,11 @@ multi-agent-llm-company-system/
 │   └── roles.py · validation.py
 │
 ├── tools/                   # Agent tool integrations (git, LSP, test runner)
-├── utils/                   # Health checker, usage tracker, output validator
+├── utils/                   # health_check.py · cost_tracker.py · output_validator.py · shell_safety.py
 ├── ui/                      # Rich terminal interface + streaming
 ├── docs/assets/             # Org chart · execution flow · terminal screenshots
 ├── tests/
+├── scripts/                 # Dev checks: naming, markdown, imports, agent integration
 ├── .env.example             # Full backend + model configuration template
 ├── main.py                  # CLI entry point (also: multi-agent-llm-company-system)
 ├── interactive_mode.py      # Standalone interactive coding session
