@@ -393,6 +393,8 @@ MODULE_FLAG_ALLOWED = [
     "python3 -m http.server",
     "python3 -m pytest -q",
     "python3 -m pytest -v",
+    # Same hand-off spelled the way python's getopt also accepts it.
+    "python3 -mpytest -c pytest.ini",
 ]
 
 # A code flag BEFORE the -m boundary is still the interpreter's own flag

@@ -26,25 +26,31 @@ from .shell_safety import find_path_escape, find_shell_operator
 _INLINE_CODE_FLAGS = ("-c", "-e", "--eval", "-r")
 
 
-def _find_inline_code_flag(args: List[str]) -> Optional[str]:
+def _find_inline_code_flag(args: List[str], base_cmd: str) -> Optional[str]:
     """Return the inline-code flag found in ``args``, or ``None``.
 
-    ``args`` must be the interpreter's own arguments. Scanning stops at
-    the ``-m <module>`` boundary: everything after ``-m`` belongs to the
-    module's argument vector, not to the interpreter, so
+    ``args`` must be the interpreter's own arguments and ``base_cmd`` the
+    interpreter they were parsed for. For python-family interpreters
+    (``base_cmd`` starting with ``python``) scanning stops at the ``-m``
+    boundary — both spellings, ``-m <module>`` and the attached
+    ``-mpytest`` form python's getopt accepts — because everything after
+    ``-m`` belongs to the module's argument vector, not to python's:
     ``python3 -m pytest -c pytest.ini`` and ``python3 -m pip install -e .``
-    are module flags, not inline-code flags. A code flag appearing
-    before ``-m`` is still rejected (``python3 -c '<code>' -m pytest``).
+    are module flags, not inline-code flags. A code flag appearing before
+    ``-m`` is still rejected (``python3 -c '<code>' -m pytest``).
 
-    Within the interpreter's own arguments, the code-flag family is
-    rejected wherever it appears (``python3 -O -c ...``,
-    ``python3 -X importtime -c ...``), in ``--flag=value`` spelling
-    (``node --eval=<code>``), and attached to its payload
-    (``python3 -c"<code>"`` leaves ``-c<code>`` in a single token
-    after ``shlex.split``; likewise ``perl -e'<code>'``).
+    The boundary is python-specific: ``-m`` is not a module hand-off for
+    the other interpreters in the allowlisted set (for ``bash``/``sh`` it
+    selects job-control mode), so their arguments are always scanned.
+
+    Within the scanned arguments the code-flag family is rejected wherever
+    it appears (``python3 -O -c ...``, ``python3 -X importtime -c ...``),
+    in ``--flag=value`` spelling (``node --eval=<code>``), and attached to
+    its payload (``python3 -c"<code>"`` leaves ``-c<code>`` in a single
+    token after ``shlex.split``; likewise ``perl -e'<code>'``).
     """
     for arg in args:
-        if arg == "-m":
+        if base_cmd.startswith("python") and arg.startswith("-m"):
             # Module boundary: the rest of the argv is the module's.
             return None
         if arg in _INLINE_CODE_FLAGS:
@@ -201,12 +207,14 @@ class CommandValidator:
                 # through `python -c "..."` which passes the allowlist. The
                 # flag is rejected wherever it appears in the interpreter's own
                 # arguments (not only at cmd_parts[1]), in `--flag=value`
-                # spelling, and when attached to its payload as a single token.
-                # The scan stops at the `-m <module>` boundary: after `-m` the
-                # arguments belong to the module (`python3 -m pytest -c pytest.ini`).
+                # when attached to its payload as a single token.
+                # For python-family interpreters the scan stops at the
+                # `-m <module>` boundary: after `-m` the arguments belong to
+                # the module (`python3 -m pytest -c pytest.ini`); other
+                # interpreters have no module hand-off and stay fully scanned.
                 interpreters_inline = {"python", "python3", "node", "npx", "ruby", "perl", "bash", "sh"}
                 if base_cmd in interpreters_inline:
-                    inline_flag = _find_inline_code_flag(cmd_parts[1:])
+                    inline_flag = _find_inline_code_flag(cmd_parts[1:], base_cmd)
                     if inline_flag:
                         return False, (
                             f"Blocked inline code execution: {base_cmd} {inline_flag}. "
