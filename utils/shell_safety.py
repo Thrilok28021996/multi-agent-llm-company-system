@@ -83,6 +83,91 @@ def find_shell_operator(command: str) -> str | None:
     return None
 
 
+# Inline-code flag spellings accepted by the allowlisted interpreters
+# (``-c``/``-e``/``-r`` payloads for the interpreter family, ``--eval=``
+# in node's ``--flag=value`` spelling).
+_INLINE_CODE_FLAGS = ("-c", "-e", "--eval", "-r")
+
+# python options that take their value from the FOLLOWING argv token when
+# spelled as a bare option (``-X importtime``, ``-W ignore``,
+# ``--check-hash-based-pycs never``). With an attached value
+# (``-Ximporttime``, ``-Xopt=value``, ``-Wall``) CPython reads the value
+# from the same token and consumes nothing after it — verified live against
+# CPython 3.12: ``python3 -W -m -c 'print(1)'`` reports the ``-m`` token as
+# an invalid -W action (it was consumed as -W's value) and then runs the
+# ``-c`` payload, while ``python3 -Wall -c 'print(1)'`` runs the payload
+# directly.
+_PYTHON_VALUE_TAKING_OPTIONS = ("-X", "-W", "--check-hash-based-pycs")
+
+
+def _find_inline_code_flag(args: list[str], base_cmd: str) -> str | None:
+    """Return the inline-code flag found in ``args``, or ``None``.
+
+    ``args`` must be the interpreter's own arguments and ``base_cmd`` the
+    interpreter they were parsed for. This is the SINGLE implementation of
+    the scan, shared by every guarded command path (``CommandExecutor``,
+    ``BashTool``, ``TaskTool`` and the sandbox ``CommandValidator``).
+
+    The code-flag family is rejected wherever it appears in the
+    interpreter's own argv: exact (``-c``, ``-e``, ``--eval``, ``-r``),
+    in ``--flag=value`` spelling (``node --eval=<code>``), and attached to
+    its payload (``python3 -c"<code>"`` / ``perl -e'<code>'`` leave
+    ``-c<code>`` / ``-e<code>`` as a single token after ``shlex.split``).
+
+    For python-family interpreters (``base_cmd`` starting with ``python``)
+    two rules model how CPython itself parses its own argv:
+
+    * ``-X``, ``-W`` and ``--check-hash-based-pycs`` take their value from
+      the FOLLOWING token when spelled as a bare option, so that token is
+      skipped: in ``python3 -X -m -c 'print(1)'`` the ``-m`` is the value
+      of ``-X`` (python then runs the ``-c`` payload — verified live), never
+      the module boundary, and the later ``-c`` is still rejected.
+      Attached spellings (``-Ximporttime``, ``-Xopt=value``, ``-Wall``)
+      carry the value in the same token and consume nothing after it.
+
+    * ``-m`` in flag position — the exact ``-m`` token or the attached
+      ``-m<module>`` form python's getopt accepts, after any value token
+      above has been skipped — ends the scan: everything after it belongs
+      to the module's argument vector, not to python's
+      (``python3 -m pytest -c pytest.ini`` and ``python3 -m pip install
+      -e .`` run the module, not python's own flags). A code flag before
+      the boundary is still python's own and stays rejected
+      (``python3 -c '<code>' -m pytest``).
+
+    The boundary is python-specific: ``-m`` is not a module hand-off for
+    the other interpreters in the allowlisted set (for ``bash``/``sh`` it
+    selects job-control mode), so their arguments are always scanned in
+    full.
+    """
+    is_python_family = base_cmd.startswith("python")
+    index = 0
+    while index < len(args):
+        arg = args[index]
+
+        if is_python_family and arg in _PYTHON_VALUE_TAKING_OPTIONS:
+            # The next token is this option's VALUE, not a python flag:
+            # skip it so a value such as `-m` or `-c` is never mistaken for
+            # the module boundary or a code flag (D1).
+            index += 2
+            continue
+
+        if is_python_family and arg.startswith("-m"):
+            # Module hand-off: the rest of the argv is the module's.
+            return None
+
+        if arg in _INLINE_CODE_FLAGS:
+            return arg
+        if arg.startswith("--eval="):
+            return "--eval=..."
+        if arg.startswith("-c") and len(arg) > 2:
+            return "-c..."
+        if arg.startswith("-e") and len(arg) > 2:
+            return "-e..."
+        index += 1
+
+    return None
+
+
 def _is_path_token(token: str) -> bool:
     """True when a token looks like a filesystem path worth validating."""
     if not token or "://" in token:

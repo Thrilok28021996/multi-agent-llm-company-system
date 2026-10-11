@@ -543,3 +543,185 @@ class TestReadmeModuleReferences:
         text = README.read_text(encoding="utf-8")
         assert "usage_tracker" not in text
         assert "usage tracker" not in text.lower()
+
+
+# ============================================================
+#  D1 (fix cycle 2): the -m boundary must respect python's
+#  value-taking options, from ONE shared implementation
+# ============================================================
+
+# CPython parses `-X`, `-W` and `--check-hash-based-pycs` with getopt
+# semantics: a BARE `-X`/`-W` consumes the following token as its value
+# (verified live on CPython 3.12.13 — `python3 -W -m -c 'print(1)'`
+# reports "-m" as an invalid -W action and then RUNS the payload). The old
+# scan ended at any token starting with "-m", so the swallowed "-m" opened
+# the module boundary and "-c" was never reached. Each of these runs a
+# `-c` payload in python's own argv and must be BLOCKED at all four gates.
+D1_VALUE_SMUGGLING_BLOCKED = [
+    "python3 -X -m -c 'print(1)'",
+    "python3 -W -m -c 'print(1)'",
+    "python3 -X -mpytest -c 'print(1)'",
+    # Attached/equals spellings consume nothing, so `-c` is python's own flag.
+    "python3 -X=importtime -c 'print(1)'",
+    "python3 -W action=mod -c 'print(1)'",
+]
+
+# The F1 cases that must NOT regress: after a real `-m` module hand-off the
+# remaining flags belong to the module (pytest's -c config file, pip's -e
+# extras), so they stay ALLOWED at all four gates.
+D1_MODULE_HANDOFF_ALLOWED = [
+    "python3 -m pytest -c pytest.ini",
+    "python3 -m pip install -e .",
+    'python3 -m pip install -e ".[dev]"',
+    "python3 -mpytest -c pytest.ini",
+]
+
+
+class TestD1ValueTakingOptionSmuggling:
+    """D1: `-X`/`-W` swallow a following `-m`, which must not open the
+    module boundary — all four gates must block the payload."""
+
+    @pytest.mark.parametrize("command", D1_VALUE_SMUGGLING_BLOCKED)
+    def test_blocked_by_all_entry_points(
+        self, command, executor, bash_tool, sandbox_validator, task_tool
+    ):
+        # Gate 1 — CommandExecutor
+        is_safe, reason = executor._is_command_safe(command)
+        assert not is_safe, f"CommandExecutor allowed: {command}"
+        assert "inline code execution" in reason.lower()
+
+        # Gate 2 — sandbox CommandValidator
+        is_valid, reason = sandbox_validator.validate(command)
+        assert not is_valid, f"CommandValidator allowed: {command}"
+        assert reason and "inline code execution" in reason
+
+        # Gate 3 — BashTool (rejected before any subprocess runs)
+        result = bash_tool.execute(command)
+        assert not result.success, f"BashTool allowed: {command}"
+        assert "Blocked inline code execution" in (result.error or "")
+
+        # Gate 4 — TaskTool (rejected before anything is spawned)
+        result = task_tool.run_background(command)
+        assert not result.success, f"TaskTool allowed: {command}"
+        assert "Blocked inline code execution" in (result.error or "")
+
+    @pytest.mark.parametrize("command", D1_MODULE_HANDOFF_ALLOWED)
+    def test_module_handoff_still_allowed_by_all_entry_points(
+        self, command, executor, bash_tool, sandbox_validator, task_tool, monkeypatch
+    ):
+        # Gate 1 — CommandExecutor
+        is_safe, reason = executor._is_command_safe(command)
+        assert is_safe, f"CommandExecutor rejected {command}: {reason}"
+
+        # Gate 2 — sandbox CommandValidator
+        is_valid, reason = sandbox_validator.validate(command)
+        assert is_valid, f"CommandValidator rejected {command}: {reason}"
+
+        # Gate 3 — BashTool (subprocess stubbed: only the safety layer runs)
+        class _Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        monkeypatch.setattr(
+            "tools.unified_tools.subprocess.run",
+            lambda *args, **kwargs: _Completed(),
+        )
+        result = bash_tool.execute(command)
+        assert result.success, f"BashTool rejected {command}: {result.error}"
+        assert "Blocked" not in (result.error or "")
+
+        # Gate 4 — TaskTool (background runner stubbed: only the gate runs)
+        monkeypatch.setattr(
+            TaskTool,
+            "_execute",
+            lambda self, task, work_dir, timeout: None,
+        )
+        result = task_tool.run_background(command)
+        assert result.success, f"TaskTool rejected {command}: {result.error}"
+        assert "Blocked" not in (result.error or "")
+
+
+class TestInlineCodeScanHasSingleSourceOfTruth:
+    """The dedupe acceptance criterion: exactly ONE definition of the scan
+    in the whole repository, and every guarded command path resolves to it.
+    Both checks are structural — a future hand-copied re-implementation
+    fails this suite even if its behaviour is identical."""
+
+    def test_exactly_one_definition_in_the_repository(self):
+        # The marker is assembled at RUNTIME from two parts: adjacent string
+        # literals are constant-folded at compile time, which would leak the
+        # pattern into this file's .pyc and add noise to the repo-wide grep
+        # acceptance check for the scan's definition (whose output must stay
+        # exactly one line, in source and in bytecode).
+        scan_keyword, scan_name = "def", "_find_inline_code_flag"
+        definition_marker = scan_keyword + " " + scan_name
+        repo_root = Path(__file__).resolve().parent.parent
+        definitions = []
+        for path in sorted(repo_root.rglob("*.py")):
+            if "__pycache__" in path.parts or ".git" in path.parts:
+                continue
+            for lineno, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                if definition_marker in line:
+                    definitions.append(f"{path.relative_to(repo_root)}:{lineno}")
+        assert len(definitions) == 1, (
+            "expected exactly one definition of the inline-code scan, found "
+            f"{len(definitions)}: {definitions}"
+        )
+        assert definitions[0].startswith("utils/shell_safety.py:"), definitions[0]
+
+    def test_all_four_gates_resolve_to_the_shared_function(self):
+        """Import identity: CommandExecutor, BashTool, TaskTool and the
+        sandbox CommandValidator all use utils.shell_safety's function."""
+        import tools.command_executor as command_executor
+        import tools.unified_tools as unified_tools
+        import utils.sandbox as sandbox
+        import utils.shell_safety as shell_safety
+
+        shared = shell_safety._find_inline_code_flag
+        assert shared.__module__ == "utils.shell_safety"
+
+        # Gate modules resolve the name from their module namespace —
+        # identical object, not an equal copy.
+        gates = {
+            "CommandExecutor": command_executor,
+            "BashTool/TaskTool": unified_tools,
+            "CommandValidator": sandbox,
+        }
+        for gate, module in gates.items():
+            assert getattr(module, "_find_inline_code_flag", None) is shared, (
+                f"{gate} does not use utils.shell_safety's "
+                f"_find_inline_code_flag (a re-copy has been introduced)"
+            )
+
+    def test_command_validator_gate_calls_the_shared_binding(self, monkeypatch):
+        """Behavioural proof for the fourth gate: CommandValidator.validate
+        resolves the scan from its module namespace (where the shared
+        function was imported). Swap that binding for a canary and show the
+        validator actually routes through it — combined with the identity
+        check above, the gate provably calls utils.shell_safety's function."""
+        import utils.sandbox as sandbox
+        import utils.shell_safety as shell_safety
+
+        # The binding the gate reads IS the shared function.
+        assert sandbox._find_inline_code_flag is shell_safety._find_inline_code_flag
+
+        seen = []
+
+        def _canary(args, base_cmd):
+            seen.append((list(args), base_cmd))
+            return None
+
+        monkeypatch.setattr(sandbox, "_find_inline_code_flag", _canary)
+
+        config = SandboxConfig(
+            mode=SandboxMode.STANDARD,
+            allowed_commands=["python3"],
+            working_dir=str(Path.cwd()),
+        )
+        validator = CommandValidator(config)
+        is_valid, reason = validator.validate("python3 -m pytest -c pytest.ini")
+        assert is_valid, reason
+        assert seen == [(["-m", "pytest", "-c", "pytest.ini"], "python3")]

@@ -9,49 +9,12 @@ from dataclasses import dataclass
 from datetime import datetime
 import asyncio
 
-from utils.shell_safety import find_path_escape, find_shell_operator, is_within_workspace
-
-# Inline-code flag spellings accepted by the interpreters in
-# ``CommandExecutor._INTERPRETERS_INLINE``.
-_INLINE_CODE_FLAGS = ("-c", "-e", "--eval", "-r")
-
-
-def _find_inline_code_flag(args: List[str], base_cmd: str) -> Optional[str]:
-    """Return the inline-code flag found in ``args``, or ``None``.
-
-    ``args`` must be the interpreter's own arguments and ``base_cmd`` the
-    interpreter they were parsed for. For python-family interpreters
-    (``base_cmd`` starting with ``python``) scanning stops at the ``-m``
-    boundary — both spellings, ``-m <module>`` and the attached
-    ``-mpytest`` form python's getopt accepts — because everything after
-    ``-m`` belongs to the module's argument vector, not to python's:
-    ``python3 -m pytest -c pytest.ini`` and ``python3 -m pip install -e .``
-    are module flags, not inline-code flags. A code flag appearing before
-    ``-m`` is still rejected (``python3 -c '<code>' -m pytest``).
-
-    The boundary is python-specific: ``-m`` is not a module hand-off for
-    the other interpreters in the allowlisted set (for ``bash``/``sh`` it
-    selects job-control mode), so their arguments are always scanned.
-
-    Within the scanned arguments the code-flag family is rejected wherever
-    it appears (``python3 -O -c ...``, ``python3 -X importtime -c ...``),
-    in ``--flag=value`` spelling (``node --eval=<code>``), and attached to
-    its payload (``python3 -c"<code>"`` leaves ``-c<code>`` in a single
-    token after ``shlex.split``; likewise ``perl -e'<code>'``).
-    """
-    for arg in args:
-        if base_cmd.startswith("python") and arg.startswith("-m"):
-            # Module boundary: the rest of the argv is the module's.
-            return None
-        if arg in _INLINE_CODE_FLAGS:
-            return arg
-        if arg.startswith("--eval="):
-            return "--eval=..."
-        if arg.startswith("-c") and len(arg) > 2:
-            return "-c..."
-        if arg.startswith("-e") and len(arg) > 2:
-            return "-e..."
-    return None
+from utils.shell_safety import (
+    _find_inline_code_flag,
+    find_path_escape,
+    find_shell_operator,
+    is_within_workspace,
+)
 
 
 @dataclass
@@ -152,11 +115,14 @@ class CommandExecutor:
 
             # Block inline code execution — LLM can smuggle arbitrary code through
             # `python -c "import os; os.system(...)"` which passes the allowlist.
-            # The flag is rejected wherever it appears in the interpreter's own
-            # arguments (not only at parts[1]), in `--flag=value` spelling, and
-            # when attached to its payload as a single token. For python-family
-            # interpreters the scan stops at the `-m <module>` boundary: after
-            # `-m` the arguments belong to the module
+            # The scan lives in utils.shell_safety (single implementation shared
+            # by all four gates). The flag is rejected wherever it appears in the
+            # interpreter's own arguments (not only at parts[1]), in `--flag=value`
+            # spelling, and when attached to its payload as a single token. For
+            # python-family interpreters the scan consumes the value of the
+            # value-taking options `-X`/`-W` (so `python3 -X -m -c ...` still
+            # reaches the `-c` check) and stops at the `-m <module>` boundary:
+            # after `-m` the arguments belong to the module
             # (`python3 -m pytest -c pytest.ini`), not to python.
             if base_cmd in self._INTERPRETERS_INLINE:
                 inline_flag = _find_inline_code_flag(parts[1:], base_cmd)
