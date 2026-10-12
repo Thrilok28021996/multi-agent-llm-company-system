@@ -642,6 +642,118 @@ class TestD1ValueTakingOptionSmuggling:
         assert "Blocked" not in (result.error or "")
 
 
+# ============================================================
+#  [A] (fix cycle 3): getopt-style clustered short options
+# ============================================================
+
+# Reviewer finding [A] (2026-10-11, pre-existing at base 63c859d): CPython
+# parses short-option clusters letter-by-letter, so the code flag need not
+# be the token's FIRST character. Live-verified on CPython 3.12.13
+# (/Volumes/personal/conda_envs/assi/bin/python3.12): every form below
+# EXECUTES a `-c` payload — `-Oc`/`-vOc`/`-Bc`/`-Oc<code>` all print 1,
+# and `-cO` raises NameError on the executed code "O" — so each must be
+# BLOCKED at all four gates.
+CLUSTER_CODE_FLAG_BLOCKED = [
+    "python3 -Oc 'print(1)'",
+    "python3 -vOc 'print(1)'",
+    "python3 -Bc 'print(1)'",
+    "python3 -Oc'print(1)'",
+    # `c` in flag position after another plain flag letter; live CPython
+    # executes the code that follows inside the same cluster token.
+    "python3 -cO",
+]
+
+# Live-CPython-backed ALLOW cases (every entry proven non-executing against
+# the same interpreter). `-m` inside a cluster is the module hand-off
+# (`python3 -Om pytest --version` prints "pytest 9.0.3" live), and a
+# value-taking `X`/`W` inside a cluster consumes the REST OF THE TOKEN as
+# its value (getopt value-nesting): `python3 -OXc foo` opens `foo` as a
+# SCRIPT file live ("can't open file .../foo", never code execution), so
+# the `c` after `X` must not be read as a code flag.
+CLUSTER_MODULE_OR_VALUE_ALLOWED = [
+    "python3 -Om pytest --version",
+    # module args after a cluster hand-off are never scanned as python flags
+    "python3 -Om pytest -c pytest.ini",
+    "python3 -Om pytest -r a",
+    # getopt value-nesting: c is inside -X's value, foo is a script name
+    "python3 -OXc foo",
+    "python3 -XOc foo",
+    "python3 -Xc foo",
+    "python3 -Wc foo",
+    "python3 -WOc foo",
+    # bare -W swallows the next token (-Om) as its value (D1 behaviour;
+    # live: "Invalid -W option ignored ... '-Om'" then pytest is opened as
+    # a script file) — no inline code executes, so this stays allowed.
+    "python3 -W -Om pytest",
+]
+
+
+class TestClusteredShortOptionBypass:
+    """[A]: a code flag inside a getopt short-option cluster must be
+    rejected, while a cluster module hand-off and getopt value-nesting
+    must not over-block. Applied identically at all four gates."""
+
+    @pytest.mark.parametrize("command", CLUSTER_CODE_FLAG_BLOCKED)
+    def test_cluster_code_flag_blocked_by_all_entry_points(
+        self, command, executor, bash_tool, sandbox_validator, task_tool
+    ):
+        # Gate 1 — CommandExecutor
+        is_safe, reason = executor._is_command_safe(command)
+        assert not is_safe, f"CommandExecutor allowed: {command}"
+        assert "inline code execution" in reason.lower()
+
+        # Gate 2 — sandbox CommandValidator
+        is_valid, reason = sandbox_validator.validate(command)
+        assert not is_valid, f"CommandValidator allowed: {command}"
+        assert reason and "inline code execution" in reason
+
+        # Gate 3 — BashTool (rejected before any subprocess runs)
+        result = bash_tool.execute(command)
+        assert not result.success, f"BashTool allowed: {command}"
+        assert "Blocked inline code execution" in (result.error or "")
+
+        # Gate 4 — TaskTool (rejected before anything is spawned)
+        result = task_tool.run_background(command)
+        assert not result.success, f"TaskTool allowed: {command}"
+        assert "Blocked inline code execution" in (result.error or "")
+
+    @pytest.mark.parametrize("command", CLUSTER_MODULE_OR_VALUE_ALLOWED)
+    def test_cluster_module_and_value_nesting_allowed_by_all_entry_points(
+        self, command, executor, bash_tool, sandbox_validator, task_tool, monkeypatch
+    ):
+        # Gate 1 — CommandExecutor
+        is_safe, reason = executor._is_command_safe(command)
+        assert is_safe, f"CommandExecutor rejected {command}: {reason}"
+
+        # Gate 2 — sandbox CommandValidator
+        is_valid, reason = sandbox_validator.validate(command)
+        assert is_valid, f"CommandValidator rejected {command}: {reason}"
+
+        # Gate 3 — BashTool (subprocess stubbed: only the safety layer runs)
+        class _Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        monkeypatch.setattr(
+            "tools.unified_tools.subprocess.run",
+            lambda *args, **kwargs: _Completed(),
+        )
+        result = bash_tool.execute(command)
+        assert result.success, f"BashTool rejected {command}: {result.error}"
+        assert "Blocked" not in (result.error or "")
+
+        # Gate 4 — TaskTool (background runner stubbed: only the gate runs)
+        monkeypatch.setattr(
+            TaskTool,
+            "_execute",
+            lambda self, task, work_dir, timeout: None,
+        )
+        result = task_tool.run_background(command)
+        assert result.success, f"TaskTool rejected {command}: {result.error}"
+        assert "Blocked" not in (result.error or "")
+
+
 class TestInlineCodeScanHasSingleSourceOfTruth:
     """The dedupe acceptance criterion: exactly ONE definition of the scan
     in the whole repository, and every guarded command path resolves to it.

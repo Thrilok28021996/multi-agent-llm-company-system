@@ -134,6 +134,18 @@ def _find_inline_code_flag(args: list[str], base_cmd: str) -> str | None:
       the boundary is still python's own and stays rejected
       (``python3 -c '<code>' -m pytest``).
 
+    * getopt-style short-option CLUSTERS are decomposed left-to-right
+      (``python3 -Oc '<code>'``, ``-vOc``, ``-Bc``, ``-Oc<code>`` all
+      execute a ``-c`` payload in live CPython — the code flag need not
+      be the token's first letter). Per letter, the rules above apply in
+      flag position: ``c``/``e`` is a code flag (rejected), ``m`` opens
+      the module boundary, and a value-taking ``X``/``W`` consumes the
+      REST OF THE TOKEN as its value (getopt value-nesting), ending
+      decomposition of that token: in ``-OXc foo`` the ``c`` is ``-X``'s
+      value, so ``foo`` is a script name, not code (verified live); when
+      the cluster ends on the value-taker (``-OX``), the value is the
+      NEXT token instead, exactly like a bare ``-X``.
+
     The boundary is python-specific: ``-m`` is not a module hand-off for
     the other interpreters in the allowlisted set (for ``bash``/``sh`` it
     selects job-control mode), so their arguments are always scanned in
@@ -163,6 +175,39 @@ def _find_inline_code_flag(args: list[str], base_cmd: str) -> str | None:
             return "-c..."
         if arg.startswith("-e") and len(arg) > 2:
             return "-e..."
+
+        if is_python_family and arg.startswith("-") and not arg.startswith("--"):
+            # getopt-style short-option CLUSTER (``-Oc``, ``-vOc``, ``-Bc``,
+            # ``-Oc<code>``): CPython parses the token letter-by-letter, so
+            # the code flag can sit anywhere inside it. Decompose the token
+            # left-to-right and apply the rules above per letter.
+            consume = 1
+            for position, letter in enumerate(arg[1:], start=1):
+                if letter in ("c", "e"):
+                    # Code flag in flag position: its payload is the rest
+                    # of the token (``-Oc<code>``) or the following token
+                    # (``-Oc <code>``) — either way python executes it.
+                    return f"-{letter}..."
+                if letter == "m":
+                    # Module hand-off from inside the cluster
+                    # (``python3 -Om pytest``): the rest of argv is the
+                    # module's, never python's own flags.
+                    return None
+                if letter in ("X", "W"):
+                    # getopt value-nesting: a value-taking option consumes
+                    # the REST OF THE TOKEN as its value, so any later
+                    # letter is part of the value, not a flag — in
+                    # ``-OXc foo`` the ``c`` is ``-X``'s value and python
+                    # runs ``foo`` as a script, never as code (verified
+                    # live). When the cluster ENDS on the value-taker
+                    # (``-OX``), the value is the NEXT token instead,
+                    # exactly like a bare ``-X``.
+                    if position == len(arg) - 1:
+                        consume = 2
+                    break
+            index += consume
+            continue
+
         index += 1
 
     return None
