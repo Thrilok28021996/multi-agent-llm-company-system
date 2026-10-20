@@ -31,6 +31,7 @@ class RAGStore:
         self._vectorizer = None
         self._matrix = None
         self._sklearn_available = self._check_sklearn()
+        self._dirty = True  # needs refit before next retrieve()
         self._load()
 
     def _check_sklearn(self) -> bool:
@@ -47,6 +48,7 @@ class RAGStore:
                 data = json.loads(index_path.read_text())
                 self.documents = [RAGDocument(**d) for d in data]
                 self._refit()
+                self._dirty = False
             except Exception:
                 self.documents = []
 
@@ -60,16 +62,26 @@ class RAGStore:
         from sklearn.feature_extraction.text import TfidfVectorizer
         self._vectorizer = TfidfVectorizer(max_features=10000, stop_words="english")
         corpus = [d.content for d in self.documents]
-        self._matrix = self._vectorizer.fit_transform(corpus)
+        try:
+            self._matrix = self._vectorizer.fit_transform(corpus)
+        except ValueError:
+            # Empty vocabulary — e.g. every document is stop words only.
+            # Leave matrix unset so retrieve() falls back to keyword overlap
+            # instead of raising on every call.
+            self._vectorizer = None
+            self._matrix = None
 
     def add(self, content: str, tags: List[str], source: str) -> str:
-        doc_id = hashlib.md5(content.encode()).hexdigest()[:12]
+        # Hash what is actually stored: ids must match the truncated content,
+        # otherwise the id cannot be reproduced from the stored document.
+        stored_content = content[:3000]
+        doc_id = hashlib.md5(stored_content.encode()).hexdigest()[:12]
         # Avoid duplicates
         if any(d.id == doc_id for d in self.documents):
             return doc_id
-        doc = RAGDocument(id=doc_id, content=content[:3000], tags=tags, source=source)
+        doc = RAGDocument(id=doc_id, content=stored_content, tags=tags, source=source)
         self.documents.append(doc)
-        self._refit()
+        self._dirty = True  # refit lazily before next retrieve()
         self._save()
         return doc_id
 
@@ -77,6 +89,9 @@ class RAGStore:
         k = top_k or self.top_k
         if not self.documents:
             return []
+        if self._dirty:
+            self._refit()
+            self._dirty = False
         if not self._sklearn_available or self._matrix is None or len(self.documents) < 2:
             # Fallback: simple keyword overlap
             results = []

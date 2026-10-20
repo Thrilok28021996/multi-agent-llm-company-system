@@ -23,6 +23,7 @@ Tools included:
 import asyncio
 import json
 import re
+import shlex
 import subprocess
 import threading
 import time
@@ -33,6 +34,13 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
+
+from utils.shell_safety import (
+    _find_inline_code_flag,
+    find_path_escape,
+    find_shell_operator,
+    is_within_workspace,
+)
 
 # Web dependencies are optional
 HAS_WEB_DEPS = False
@@ -513,6 +521,7 @@ class GrepTool:
 #  BASH TOOL
 # ============================================================
 
+
 class BashTool:
     """Safe bash command execution with allowlist."""
 
@@ -528,6 +537,9 @@ class BashTool:
         'black', 'ruff', 'eslint', 'prettier',
     }
 
+    # Interpreters that accept inline code — LLM can smuggle arbitrary code
+    _INTERPRETERS_INLINE = {"python", "python3", "node", "npx", "ruby", "perl", "bash", "sh"}
+
     def __init__(self, workspace_root: str = ".", safe_mode: bool = True):
         self.workspace_root = Path(workspace_root).resolve()
         self.safe_mode = safe_mode
@@ -541,14 +553,64 @@ class BashTool:
         """Execute a bash command."""
         try:
             if self.safe_mode:
-                base_cmd = command.split()[0] if command.split() else ""
+                # shlex, not str.split(): a quoted flag such as
+                # `python3 "-c" "print(1)"` must still be recognised as -c.
+                try:
+                    parts = shlex.split(command)
+                except ValueError as e:
+                    return ToolResult(
+                        success=False,
+                        error=f"Unparseable command: {e}"
+                    )
+                base_cmd = parts[0] if parts else ""
                 if base_cmd not in self.SAFE_COMMANDS:
                     return ToolResult(
                         success=False,
                         error=f"Command '{base_cmd}' not in safe list. Disable safe_mode to run."
                     )
+                # Block inline code execution — same bypass as CommandExecutor.
+                # The scan is the shared implementation in utils.shell_safety.
+                # The flag is rejected wherever it appears in the interpreter's
+                # own arguments (not only at parts[1]), in `--flag=value`
+                # spelling, and when attached to its payload as a single token.
+                # For python-family interpreters the scan consumes the value of
+                # the value-taking options `-X`/`-W` and stops at the
+                # `-m <module>` boundary: after `-m` the arguments belong to the
+                # module (`python3 -m pip install -e .`). Other interpreters have
+                # no module hand-off (`bash -m` is job control), so they are
+                # always scanned.
+                if base_cmd in self._INTERPRETERS_INLINE:
+                    inline_flag = _find_inline_code_flag(parts[1:], base_cmd)
+                    if inline_flag:
+                        return ToolResult(
+                            success=False,
+                            error=(
+                                f"Blocked inline code execution: {base_cmd} {inline_flag}. "
+                                "Write code to a file and execute it instead."
+                            )
+                        )
+                # Shell chaining, pipes, redirection and substitution run
+                # commands that never touch the allowlist.
+                operator = find_shell_operator(command)
+                if operator:
+                    return ToolResult(
+                        success=False,
+                        error=(
+                            f"Blocked {operator}. "
+                            "Run a single command per call; chaining bypasses the allowlist."
+                        )
+                    )
+                # Arguments must not point outside the configured workspace.
+                escape = find_path_escape(command, self.workspace_root)
+                if escape:
+                    return ToolResult(success=False, error=f"Blocked {escape}.")
 
             work_dir = self._resolve_path(cwd) if cwd else self.workspace_root
+            if not is_within_workspace(work_dir, self.workspace_root):
+                return ToolResult(
+                    success=False,
+                    error=f"Working directory outside workspace: {cwd}"
+                )
 
             result = subprocess.run(
                 command,
@@ -831,7 +893,7 @@ class NotebookTool:
 
             if edit_mode == "delete":
                 if cell_index < 0 or cell_index >= len(cells):
-                    return ToolResult(success=False, error=f"Cell index out of range")
+                    return ToolResult(success=False, error="Cell index out of range")
                 del cells[cell_index]
 
             elif edit_mode == "insert":
@@ -847,7 +909,7 @@ class NotebookTool:
 
             else:  # replace
                 if cell_index < 0 or cell_index >= len(cells):
-                    return ToolResult(success=False, error=f"Cell index out of range")
+                    return ToolResult(success=False, error="Cell index out of range")
                 cells[cell_index]["source"] = new_source.splitlines(keepends=True)
                 cells[cell_index]["cell_type"] = cell_type
 
@@ -885,6 +947,9 @@ class BackgroundTask:
 class TaskTool:
     """Background task execution."""
 
+    # Interpreters that accept inline code — LLM can smuggle arbitrary code
+    _INTERPRETERS_INLINE = {"python", "python3", "node", "npx", "ruby", "perl", "bash", "sh"}
+
     def __init__(self, workspace_root: str = "."):
         self.workspace_root = Path(workspace_root).resolve()
         self.tasks: Dict[str, BackgroundTask] = {}
@@ -894,6 +959,62 @@ class TaskTool:
 
     def run_background(self, command: str, cwd: Optional[str] = None, timeout: int = 600) -> ToolResult:
         """Run command in background."""
+        # Inline-code hardening, same rule as BashTool: interpreters must run
+        # files or modules, never a -c/-e/--eval payload, wherever the flag
+        # appears in the interpreter's own arguments. The scan is the shared
+        # implementation in utils.shell_safety: for python-family
+        # interpreters it consumes the value of the value-taking options
+        # `-X`/`-W` and stops at the `-m <module>` boundary — after `-m` the
+        # flags belong to the module (`python3 -m pytest -r a`); other
+        # interpreters have no module hand-off and stay fully scanned.
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            # Broken quoting: fall back to the raw first token so an
+            # interpreter command cannot slip through unexamined, while
+            # non-interpreter commands keep their existing behaviour.
+            raw_first = command.lstrip().split(None, 1)
+            first = raw_first[0].strip("\"'").rsplit("/", 1)[-1] if raw_first else ""
+            if first in self._INTERPRETERS_INLINE:
+                return ToolResult(
+                    success=False,
+                    error=(
+                        f"Blocked inline code execution: {first} (unparseable command). "
+                        "Write code to a file and execute it instead."
+                    ),
+                )
+            parts = []
+        if parts:
+            base_cmd = parts[0].rsplit("/", 1)[-1] if "/" in parts[0] else parts[0]
+            if base_cmd in self._INTERPRETERS_INLINE:
+                inline_flag = _find_inline_code_flag(parts[1:], base_cmd)
+                if inline_flag:
+                    return ToolResult(
+                        success=False,
+                        error=(
+                            f"Blocked inline code execution: {base_cmd} {inline_flag}. "
+                            "Write code to a file and execute it instead."
+                        ),
+                    )
+        # Same hardening as BashTool: no shell chaining/substitution/redirection
+        # and no working directory outside the workspace.
+        operator = find_shell_operator(command)
+        if operator:
+            return ToolResult(success=False, error=f"Blocked {operator}.")
+        escape = find_path_escape(command, self.workspace_root)
+        if escape:
+            return ToolResult(success=False, error=f"Blocked {escape}.")
+
+        work_dir = Path(cwd) if cwd else self.workspace_root
+        if not work_dir.is_absolute():
+            work_dir = self.workspace_root / work_dir
+        work_dir = work_dir.resolve()
+        if not is_within_workspace(work_dir, self.workspace_root):
+            return ToolResult(
+                success=False,
+                error=f"Working directory outside workspace: {cwd}"
+            )
+
         with self._lock:
             self._counter += 1
             task_id = f"task_{self._counter}"
@@ -901,7 +1022,6 @@ class TaskTool:
         task = BackgroundTask(task_id=task_id, command=command)
         self.tasks[task_id] = task
 
-        work_dir = Path(cwd).resolve() if cwd else self.workspace_root
         self.executor.submit(self._execute, task, work_dir, timeout)
 
         return ToolResult(success=True, data={"task_id": task_id, "status": "running"})

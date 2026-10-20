@@ -9,6 +9,13 @@ from dataclasses import dataclass
 from datetime import datetime
 import asyncio
 
+from utils.shell_safety import (
+    _find_inline_code_flag,
+    find_path_escape,
+    find_shell_operator,
+    is_within_workspace,
+)
+
 
 @dataclass
 class CommandResult:
@@ -73,6 +80,10 @@ class CommandExecutor:
         self.safe_mode = safe_mode
         self.command_history: List[CommandResult] = []
 
+    # Interpreters that accept inline code via -c/-e flags — these bypass
+    # the allowlist because the LLM controls the code string, not the base command.
+    _INTERPRETERS_INLINE = {"python", "python3", "node", "npx", "ruby", "perl", "bash", "sh"}
+
     def _is_command_safe(self, command: str) -> tuple[bool, str]:
         """
         Check if a command is safe to execute.
@@ -87,7 +98,10 @@ class CommandExecutor:
 
         if self.safe_mode:
             # Extract the base command
-            parts = shlex.split(command)
+            try:
+                parts = shlex.split(command)
+            except ValueError as e:
+                return False, f"Unparseable command: {e}"
             if not parts:
                 return False, "Empty command"
 
@@ -98,6 +112,39 @@ class CommandExecutor:
 
             if base_cmd not in self.SAFE_COMMANDS:
                 return False, f"Command '{base_cmd}' not in allowed list. Safe mode is enabled."
+
+            # Block inline code execution — LLM can smuggle arbitrary code through
+            # `python -c "import os; os.system(...)"` which passes the allowlist.
+            # The scan lives in utils.shell_safety (single implementation shared
+            # by all four gates). The flag is rejected wherever it appears in the
+            # interpreter's own arguments (not only at parts[1]), in `--flag=value`
+            # spelling, and when attached to its payload as a single token. For
+            # python-family interpreters the scan consumes the value of the
+            # value-taking options `-X`/`-W` (so `python3 -X -m -c ...` still
+            # reaches the `-c` check) and stops at the `-m <module>` boundary:
+            # after `-m` the arguments belong to the module
+            # (`python3 -m pytest -c pytest.ini`), not to python.
+            if base_cmd in self._INTERPRETERS_INLINE:
+                inline_flag = _find_inline_code_flag(parts[1:], base_cmd)
+                if inline_flag:
+                    return False, (
+                        f"Blocked inline code execution: {base_cmd} {inline_flag}. "
+                        "Write code to a file and execute it instead."
+                    )
+
+            # Shell chaining, pipes, redirection and substitution execute
+            # commands that never touch the allowlist.
+            operator = find_shell_operator(command)
+            if operator:
+                return False, (
+                    f"Blocked {operator}. "
+                    "Run a single command per call; chaining bypasses the allowlist."
+                )
+
+            # Arguments must not point outside the configured workspace.
+            escape = find_path_escape(command, self.workspace_root)
+            if escape:
+                return False, f"Blocked {escape}."
 
         return True, "OK"
 
@@ -129,12 +176,19 @@ class CommandExecutor:
                 "command": command
             }
 
-        # Resolve working directory
+        # Resolve working directory — it must stay inside the workspace
         cwd = self.workspace_root
         if working_dir:
             cwd = Path(working_dir)
             if not cwd.is_absolute():
                 cwd = self.workspace_root / cwd
+            cwd = cwd.resolve()
+            if not is_within_workspace(cwd, self.workspace_root):
+                return {
+                    "success": False,
+                    "error": f"Working directory outside workspace: {working_dir}",
+                    "command": command
+                }
 
         if not cwd.exists():
             return {
@@ -223,6 +277,13 @@ class CommandExecutor:
             cwd = Path(working_dir)
             if not cwd.is_absolute():
                 cwd = self.workspace_root / cwd
+            cwd = cwd.resolve()
+            if not is_within_workspace(cwd, self.workspace_root):
+                return {
+                    "success": False,
+                    "error": f"Working directory outside workspace: {working_dir}",
+                    "command": command
+                }
 
         timeout = timeout or self.timeout
         start_time = datetime.now()

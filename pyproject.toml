@@ -19,6 +19,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Development dependencies — keep in sync with the development section of
+# requirements.txt (same packages, same version constraints).
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",

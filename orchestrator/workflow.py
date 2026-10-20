@@ -2,8 +2,7 @@
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from enum import Enum
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -16,8 +15,12 @@ from memory.session import SessionManager, SessionState
 from memory.shared_memory import SharedMemory
 from orchestrator.escalation import EscalationAction, EscalationManager
 from orchestrator.message_bus import MessageBus
+# Phase enum + confidence thresholds live in orchestrator/phase_types.py so the
+# extracted phase modules can import them without a circular import. They are
+# re-exported here for backwards compatibility.
+from orchestrator import phase_types as _phase_types
 from orchestrator.plan_mode import PlanManager
-from orchestrator.task_manager import TaskManager, TaskPriority
+from orchestrator.task_manager import TaskManager
 from research.cross_validator import CrossValidator
 from research.problem_discoverer import (DiscoveredProblem, ProblemDiscoverer,
                                          ProblemFrequency, ProblemSeverity)
@@ -31,32 +34,27 @@ from utils.health_check import HealthChecker, HealthStatus
 from utils.memory_monitor import MemoryMonitor
 from utils.progress_tracker import ProgressTracker
 from utils.structured_logging import LogLevel, get_structured_logger
+from orchestrator.phases.research import _run_research_phase, _discover_from_web_search
+from orchestrator.phases.data_analysis import _run_data_analysis_phase
+from orchestrator.phases.analysis import _run_analysis_phase
+from orchestrator.phases.opportunity import _run_opportunity_evaluation
+from orchestrator.phases.design import _run_technical_design_phase, _run_design_review_phase
+from orchestrator.phases.implementation import _run_implementation_phase
+from orchestrator.phases.quality import _run_qa_phase, _run_security_review_phase, _check_quality_gate, _evaluate_gate, _retry_gate
+from orchestrator.phases.approval import _run_ceo_approval
+from orchestrator.phases.delivery import _run_delivery_phase
+from orchestrator.phases.retrospective import _run_retrospective_phase
+from orchestrator.phases.collaboration import _team_brainstorm, _decompose_problem, _pivot_approach
+from orchestrator.phases.helpers import _check_token_budget, _get_time_context, _detect_failure_owner, _adjust_agent_behavior, _drain_messages_for_agent, _load_previous_learnings, _filter_project_files, _interactive_gate
 
-# Confidence band thresholds for graduated response
-CONFIDENCE_CRITICAL = 0.3   # Requires immediate intervention
-CONFIDENCE_LOW = 0.5        # Requires supervisor notification
-CONFIDENCE_MEDIUM = 0.7     # Standard review
-CONFIDENCE_HIGH = 0.85      # Light review
-
-
-class WorkflowPhase(Enum):
-    """Phases of the company workflow."""
-
-    IDLE = "idle"
-    RESEARCH = "research"
-    DATA_ANALYSIS = "data_analysis"
-    ANALYSIS = "analysis"
-    OPPORTUNITY_EVALUATION = "opportunity_evaluation"
-    TECHNICAL_DESIGN = "technical_design"
-    DESIGN_REVIEW = "design_review"
-    IMPLEMENTATION = "implementation"
-    CODE_EXECUTION = "code_execution"
-    QA_VALIDATION = "qa_validation"
-    SECURITY_REVIEW = "security_review"
-    CEO_APPROVAL = "ceo_approval"
-    RETROSPECTIVE = "retrospective"
-    COMPLETED = "completed"
-    FAILED = "failed"
+# NOTE: CONFIDENCE_* thresholds and WorkflowPhase are defined in
+# orchestrator/phase_types.py (imported above) so the extracted phase modules
+# can use them without a circular import.
+WorkflowPhase = _phase_types.WorkflowPhase
+CONFIDENCE_CRITICAL = _phase_types.CONFIDENCE_CRITICAL
+CONFIDENCE_LOW = _phase_types.CONFIDENCE_LOW
+CONFIDENCE_MEDIUM = _phase_types.CONFIDENCE_MEDIUM
+CONFIDENCE_HIGH = _phase_types.CONFIDENCE_HIGH
 
 
 @dataclass
@@ -1460,7 +1458,6 @@ class CompanyWorkflow:
                 self._save_checkpoint()
 
                 # Phase 6c: DevOps Validation (after QA+Security pass, before CEO)
-                devops_passed = True
                 if qa_passed and security_passed:
                     console.section(f"PHASE 6c: DEVOPS VALIDATION (Round {round_label})")
                     console.info("DevOps Engineer validating deployability...")
@@ -1491,7 +1488,6 @@ class CompanyWorkflow:
                             )
                         devops_verdict = str(devops_result.output).upper() if isinstance(devops_result.output, str) else str(devops_result.output.get("verdict", "")).upper() if isinstance(devops_result.output, dict) else ""
                         if "NOT_DEPLOYABLE" in devops_verdict:
-                            devops_passed = False
                             console.warning("DevOps: NOT_DEPLOYABLE — Developer must fix before CEO review")
                             # DevOps notifies Developer of deployment issues via message bus
                             self.message_bus.notify_issue(
@@ -1868,1277 +1864,47 @@ class CompanyWorkflow:
     #  QUALITY GATES
     # ============================================================
 
-    async def _check_quality_gate(self, phase: str) -> bool:
-        """Check quality gate for a phase. Returns True if passed, False if failed.
 
-        On failure, retries up to 2 times, then proceeds with a degradation flag.
-        """
-        max_retries = 2
 
-        for attempt in range(max_retries + 1):
-            passed, reason = self._evaluate_gate(phase)
-            if passed:
-                return True
-
-            if attempt < max_retries:
-                console.warning(f"Quality gate '{phase}' failed (attempt {attempt + 1}/{max_retries + 1}): {reason}")
-                retry_ok = await self._retry_gate(phase, reason)
-                if not retry_ok:
-                    break
-            else:
-                console.warning(f"Quality gate '{phase}' failed after {max_retries + 1} attempts: {reason}")
-
-        # Proceed with degradation flag
-        self.state.artifacts.setdefault("degraded_phases", []).append(phase)
-        console.warning(f"Proceeding with degraded quality for phase: {phase}")
-        return False
-
-    def _evaluate_gate(self, phase: str) -> tuple:
-        """Evaluate a quality gate. Returns (passed: bool, reason: str)."""
-        if phase == "research":
-            problems = self.state.artifacts.get("discovered_problems", [])
-            user_provided = self.state.artifacts.get("user_provided_problem", False)
-            min_required = 1 if user_provided else 2
-            if len(problems) < min_required:
-                return False, f"Only {len(problems)} problems found (need >= {min_required})"
-            max_score = max((p.get("score", 0) if isinstance(p, dict) else getattr(p, "score", 0)) for p in problems)
-            if not user_provided and max_score < 0.3:
-                return False, f"Max problem score {max_score:.2f} < 0.3"
-            return True, ""
-
-        elif phase == "data_analysis":
-            verdicts = self.state.artifacts.get("cross_validation_verdicts", {})
-            summary = verdicts.get("summary", {}) if isinstance(verdicts, dict) else {}
-            confirmed = summary.get("confirmed", 0) + summary.get("partially_confirmed", 0)
-            if confirmed < 1:
-                return False, "No findings confirmed or partially confirmed by DataAnalyst"
-            return True, ""
-
-        elif phase == "tech_design":
-            root_cause = self.state.artifacts.get("root_cause", "")
-            if not root_cause or len(root_cause.strip()) < 5:
-                return False, "Root cause not extracted from CTO design"
-            return True, ""
-
-        elif phase == "implementation":
-            impl = self.state.artifacts.get("implementation", {})
-            if isinstance(impl, dict):
-                files = impl.get("files_written", [])
-            else:
-                files = []
-            code_artifacts = self.state.artifacts.get("project", {})
-            if isinstance(code_artifacts, dict):
-                files = files or code_artifacts.get("files_created", [])
-            if not files:
-                return False, "No code files in implementation artifacts"
-            return True, ""
-
-        elif phase == "qa":
-            qa_output = self.state.artifacts.get("qa_validation", {})
-            if isinstance(qa_output, dict):
-                verdict = qa_output.get("verdict", "uncertain")
-            else:
-                verdict = "uncertain"
-            if verdict == "uncertain":
-                return False, "QA verdict is uncertain"
-            return True, ""
-
-        return True, ""
-
-    async def _retry_gate(self, phase: str, reason: str) -> bool:
-        """Attempt to fix a quality gate failure. Returns True if retry was attempted."""
-        if phase == "research":
-            # Re-run with expanded keywords
-            console.info("Re-running research with expanded keywords...")
-            await self._discover_from_web_search()
-            return True
-        elif phase == "data_analysis":
-            # Warn and proceed - can't easily re-run data analysis
-            console.warning(f"Data analysis gate: {reason} — proceeding with caution")
-            return False
-        elif phase == "tech_design":
-            # CTO retry
-            console.info("Re-running CTO design to extract root cause...")
-            problem = self.state.current_problem
-            if problem:
-                retry_task = {
-                    "type": "design_architecture",
-                    "problem": problem.to_dict(),
-                    "requirements": str(self.state.artifacts.get("requirements", "")),
-                    "context_messages": [],
-                }
-                result = await self.cto.execute_task(retry_task)
-                self.state.artifacts["architecture"] = result.output
-                # Re-extract root cause
-                from utils.output_parser import StructuredOutputParser
-                parser = StructuredOutputParser()
-                design_text = result.artifacts.get("architecture_doc", str(result.output))
-                parsed = parser.parse_cto_design(design_text)
-                rc = parsed.get("root_cause", "")
-                if rc:
-                    self.state.artifacts["root_cause"] = rc
-                return True
-            return False
-        elif phase == "implementation":
-            # Developer retry
-            console.info("Re-running implementation...")
-            return True  # The main loop handles this
-        elif phase == "qa":
-            # QA retry with clearer instructions
-            console.info("Re-running QA with clearer instructions...")
-            return True
-        return False
 
     # ============================================================
     #  PHASE 1: RESEARCH
     # ============================================================
 
-    async def _run_research_phase(self) -> None:
-        """Run the research phase to discover problems."""
-        self.state.phase = WorkflowPhase.RESEARCH
-
-        # Get configured subreddits
-        subreddits = self.research_sources.get_reddit_subreddits()
-        console.agent_action("Researcher", "Scanning Sources", "Reddit + HN + StackOverflow + GitHub Issues + Web Search")
-
-        # Run research sources sequentially (concurrent calls exhaust RAM on 16GB systems)
-        problems = []
-
-        research_tasks = [
-            ("Reddit", self.problem_discoverer.discover_from_reddit(subreddits[:1], limit_per_sub=25, time_period="month")),
-            ("HackerNews", self.problem_discoverer.discover_from_hacker_news(limit=30)),
-            ("StackOverflow", self.problem_discoverer.discover_from_stackoverflow(limit=20)),
-            ("GitHub", self.problem_discoverer.discover_from_github_issues(repos=["microsoft/vscode"], limit=20)),
-            ("WebSearch", self._discover_from_web_search()),
-        ]
-
-        for source_name, coro in research_tasks:
-            try:
-                result = await coro
-                if result:
-                    problems.extend(result)
-                    console.info(f"{source_name}: {len(result)} problems discovered")
-                else:
-                    console.warning(f"{source_name}: no problems found")
-            except Exception as e:
-                console.warning(f"{source_name}: error - {e}")
-
-        # Filter out previously-solved problems
-        from memory.shared_memory import MemoryType
-        solved_memories = self.shared_memory.get_by_type(MemoryType.SOLUTION)
-        if solved_memories and problems:
-            solved_descriptions = {m.content.lower() for m in solved_memories}
-            original_count = len(problems)
-            filtered = []
-            for p in problems:
-                desc = p.description.lower() if hasattr(p, 'description') else ""
-                words = set(desc.split())
-                is_solved = any(
-                    len(words & set(sd.split())) / max(len(words), 1) > 0.6
-                    for sd in solved_descriptions
-                ) if words else False
-                if not is_solved:
-                    filtered.append(p)
-            if filtered:
-                problems = filtered
-                if len(filtered) < original_count:
-                    console.info(f"Filtered {original_count - len(filtered)} previously-solved problems")
-
-        # Filter problems with existing open-source solutions
-        before_solution_check = len(problems)
-        problems = await self.problem_discoverer.filter_problems_with_solutions(problems)
-        if len(problems) < before_solution_check:
-            console.info(f"Solution check: dropped {before_solution_check - len(problems)} problems with existing solutions")
-
-        # Hard filter: only keep problems from the last 60 days
-        max_age_days = 60
-        cutoff = datetime.now() - timedelta(days=max_age_days)
-        before_filter = len(problems)
-        problems = [p for p in problems if p.discovered_at >= cutoff]
-        if len(problems) < before_filter:
-            console.info(f"Freshness filter: dropped {before_filter - len(problems)} problems older than {max_age_days} days")
-
-        # Get top problem from the already-filtered list
-        if problems:
-            top_problem = max(problems, key=lambda p: p.score)
-            self.state.current_problem = top_problem
-            console.show_problem(top_problem.to_dict())
-
-        self.state.artifacts["discovered_problems"] = [p.to_dict() for p in problems]
-        console.success(f"Discovered {len(problems)} problems")
 
     # ============================================================
     #  PHASE 3: ANALYSIS (PM + RESEARCHER)
     # ============================================================
 
-    async def _run_analysis_phase(self) -> None:
-        """Run the analysis phase with Product Manager and Researcher."""
-        self.state.phase = WorkflowPhase.ANALYSIS
-        self.structured_logger.info("Analysis phase started")
 
-        problem = self.state.current_problem
-        if not problem:
-            console.error("No problem to analyze")
-            return
-
-        # Researcher validates problem (tracked by TaskManager)
-        console.agent_action("Researcher", "Validating Problem", problem.description)
-        tm_task = self.task_manager.create_task(
-            task_type="validate_problem",
-            description=f"Validate problem: {problem.description}",
-            assigned_to="Researcher",
-            priority=TaskPriority.HIGH,
-        )
-        self.task_manager.start_task(tm_task.id)
-        validation_task = {
-            "type": "validate_problem",
-            "problem": problem.to_dict(),
-            "evidence": "\n".join(problem.evidence),
-            "context_messages": self._drain_messages_for_agent("Researcher")
-        }
-        validation_result = await self.researcher.execute_task(validation_task)
-        self.task_manager.complete_task(tm_task.id, {"status": "done"})
-        self.state.artifacts["problem_validation"] = validation_result.output
-        # Handle case where output might be a string instead of dict
-        validation_status = validation_result.output.get('status', 'analyzing') if isinstance(validation_result.output, dict) else 'analyzing'
-        console.agent_thinking("Researcher", f"Validation: {validation_status}...")
-        # Track Researcher experience and pool performance
-        if hasattr(self.researcher, '_experience'):
-            self.researcher._experience.add_experience("validate_problem", validation_result.success)
-        self.agent_pool.record_task_outcome("Researcher", validation_result.success)
-        self.performance_tracker.record_task(
-            "Researcher", success=validation_result.success,
-            response_time_ms=validation_result.execution_time * 1000, tokens=0
-        )
-        # Researcher shares findings with DataAnalyst via message bus
-        self.message_bus.share_finding(
-            "Researcher", "DataAnalyst",
-            f"Problem validation result: {validation_status}. Evidence summary: {str(validation_result.output)[:300]}"
-        )
-
-        # Product Manager analyzes problem (tracked by TaskManager)
-        console.agent_action("ProductManager", "Analyzing Market Opportunity", "Evaluating problem severity and market fit...")
-        pm_task = self.task_manager.create_task(
-            task_type="analyze_problem",
-            description=f"Analyze market opportunity: {problem.description}",
-            assigned_to="ProductManager",
-            priority=TaskPriority.HIGH,
-        )
-        self.task_manager.start_task(pm_task.id)
-        analysis_task = {
-            "type": "analyze_problem",
-            "problem": problem.to_dict(),
-            "research_data": str(validation_result.output)
-        }
-        analysis_result = await self.product_manager.execute_task(analysis_task)
-        self.state.artifacts["problem_analysis"] = analysis_result.output
-        self.task_manager.complete_task(pm_task.id, {"status": "done"})
-        # Track ProductManager experience and pool performance
-        if hasattr(self.product_manager, '_experience'):
-            self.product_manager._experience.add_experience("analyze_problem", analysis_result.success)
-        self.agent_pool.record_task_outcome("ProductManager", analysis_result.success)
-        self.performance_tracker.record_task(
-            "ProductManager", success=analysis_result.success,
-            response_time_ms=analysis_result.execution_time * 1000, tokens=0
-        )
-        # Reflect on PM problem analysis (learning)
-        if self.enable_learning:
-            self.product_manager.reflect(
-                "analyze_problem",
-                str(analysis_result.output),
-                analysis_result.success
-            )
-
-        # Reflect on validation (learning)
-        if self.enable_learning:
-            self.researcher.reflect(
-                "validate_problem",
-                str(validation_result.output),
-                validation_result.success
-            )
-
-        console.info(f"Problem: {problem.description}")
-        final_status = validation_result.output.get('status', 'done') if isinstance(validation_result.output, dict) else 'done'
-        console.success(f"Analysis complete - Validation: {final_status}")
-
-    async def _discover_from_web_search(self):
-        """Discover problems via DuckDuckGo web search with multi-query expansion."""
-        try:
-            from research.web_search import WebSearch
-            web_search = WebSearch()
-            domain = self.research_sources.get_reddit_subreddits()[0] if self.research_sources.get_reddit_subreddits() else "software"
-            year = datetime.now().year
-            base_query = f"{domain} common problems {year}"
-
-            # Use LLM-powered term expansion for broader coverage
-            try:
-                search_queries = await self.problem_discoverer.expand_search_terms(base_query, num_alternatives=4)
-            except Exception:
-                search_queries = [
-                    base_query,
-                    f"developer frustrations {domain} {year}",
-                ]
-
-            all_snippets = []
-            seen_titles = set()
-            for query in search_queries:
-                results = await web_search.search_duckduckgo(query, max_results=5)
-                for r in results:
-                    # Deduplicate across queries
-                    if r.title not in seen_titles:
-                        seen_titles.add(r.title)
-                        all_snippets.append(f"- {r.title}: {r.snippet}")
-            if not all_snippets:
-                return []
-            content = "\n".join(all_snippets[:25])
-            problems = await self.problem_discoverer._analyze_content_for_problems(
-                content, source="web_search", domain=domain
-            )
-            return problems
-        except Exception as e:
-            console.warning(f"Web search research failed: {e}")
-            return []
 
     # ============================================================
     #  PHASE 4: OPPORTUNITY EVALUATION (CEO)
     # ============================================================
 
-    async def _run_opportunity_evaluation(self) -> bool:
-        """CEO evaluates the opportunity with a decision meeting."""
-        self.state.phase = WorkflowPhase.OPPORTUNITY_EVALUATION
-
-        problem = self.state.current_problem
-        if not problem:
-            console.error("No problem to evaluate")
-            return False
-        analysis = self.state.artifacts.get("problem_analysis", {})
-
-        # Hold a decision meeting with key stakeholders
-        meeting_participants = [
-            {
-                "name": "CEO",
-                "role": "Strategic Decision Maker",
-                "model": self.model_config.get_model_name("ceo")
-            },
-            {
-                "name": "CTO",
-                "role": "Technical Advisor",
-                "model": self.model_config.get_model_name("cto")
-            },
-            {
-                "name": "ProductManager",
-                "role": "Product Strategy",
-                "model": self.model_config.get_model_name("product_manager")
-            }
-        ]
-
-        # Gather research artifacts to give decision-makers full picture
-        bias_flags = self.state.artifacts.get("bias_flags", [])
-        bias_summary = "; ".join(
-            f"{b.get('type','?')} ({b.get('severity','?')})" for b in bias_flags
-        ) if bias_flags else "None detected"
-        credibility_raw = self.state.artifacts.get("credibility_analysis", {})
-        credibility_summary = (
-            str(credibility_raw)[:300] if credibility_raw else "Not available"
-        )
-        counter_evidence = self.state.artifacts.get("counter_evidence", [])
-        counter_summary = "; ".join(
-            ce.get("description", "")[:80] for ce in counter_evidence if ce.get("counter_evidence")
-        ) or "None found"
-        opposing = self.state.artifacts.get("opposing_viewpoints", [])
-        opposing_summary = "; ".join(
-            f"{o.get('title','')}: {o.get('snippet','')[:60]}" for o in opposing[:3]
-        ) or "None found"
-        top_score = self.state.artifacts.get("discovered_problems", [{}])[0].get("score", "N/A") if self.state.artifacts.get("discovered_problems") else "N/A"
-        freshness = self.state.artifacts.get("discovered_problems", [{}])[0].get("freshness_score", "N/A") if self.state.artifacts.get("discovered_problems") else "N/A"
-
-        user_provided = self.state.artifacts.get("user_provided_problem", False)
-        if user_provided:
-            meeting_context = f"""
-Problem: {problem.description}
-Source: USER-PROVIDED REQUIREMENT (direct instruction, not research discovery)
-Target Users: {problem.target_users}
-Potential Solutions: {', '.join(problem.potential_solution_ideas) if problem.potential_solution_ideas else 'None specified'}
-
-NOTE: This is a direct user requirement. Treat as APPROVED scope — evaluate technical feasibility only, not market validity.
-"""
-        else:
-            meeting_context = f"""
-Problem: {problem.description}
-Severity: {problem.severity}
-Target Users: {problem.target_users}
-Composite Score: {top_score}
-Data Freshness: {freshness}
-Market Analysis: {str(analysis)}
-Potential Solutions: {', '.join(problem.potential_solution_ideas) if problem.potential_solution_ideas else 'None specified'}
-
---- RESEARCH QUALITY FLAGS ---
-Bias Detected: {bias_summary}
-Credibility Analysis: {credibility_summary}
-Counter-Evidence (reasons this may NOT be a real problem): {counter_summary}
-Opposing Viewpoints: {opposing_summary}
-"""
-        if self.enable_meetings:
-            meeting_outcome = await quick_meeting(
-                topic=f"Should we pursue: {problem.description}?",
-                participants=meeting_participants,
-                meeting_type=MeetingType.DECISION,
-                context=meeting_context
-            )
-
-            self.state.artifacts["opportunity_meeting"] = {
-                "decision": meeting_outcome.decision,
-                "consensus_reached": meeting_outcome.consensus_reached,
-                "votes": meeting_outcome.votes,
-                "key_insights": meeting_outcome.key_insights
-            }
-            meeting_decision = meeting_outcome.decision
-        else:
-            console.info("Meetings disabled — skipping team meeting, CEO decides alone")
-            meeting_decision = "Proceed (meetings disabled)"
-            self.state.artifacts["opportunity_meeting"] = {"decision": meeting_decision, "meetings_disabled": True}
-
-        # CEO still makes final call based on meeting
-        eval_task = {
-            "type": "evaluate_opportunity",
-            "problem": problem.to_dict(),
-            "market_analysis": str(analysis),
-            "meeting_outcome": meeting_decision,
-            "user_provided_requirement": user_provided,
-            **({"bias_flags": bias_summary, "credibility": credibility_summary,
-                "counter_evidence": counter_summary, "opposing_viewpoints": opposing_summary,
-                "freshness_score": freshness} if not user_provided else {}),
-        }
-        result = await self.ceo.execute_task(eval_task)
-
-        # Handle case where output might be a string instead of dict
-        output = result.output if isinstance(result.output, dict) else {"response": str(result.output)}
-        decision = output.get("decision", "rejected")
-        reasoning = output.get("reasoning", "")
-        meeting_consensus = meeting_outcome.consensus_reached if self.enable_meetings else None
-        self.state.decisions.append({
-            "phase": "opportunity_evaluation",
-            "decision": decision,
-            "reasoning": reasoning,
-            "meeting_consensus": meeting_consensus
-        })
-
-        self.state.artifacts["ceo_evaluation"] = result.output
-        if self.enable_meetings:
-            console.info(f"Meeting Consensus: {meeting_consensus}")
-        console.agent_decision("CEO", decision.upper(), reasoning if reasoning else "")
-
-        approved = decision == "approved"
-
-        # Devil's Advocate gate: challenge approved decisions
-        if self.enable_meetings and approved:
-            console.info("Running Devil's Advocate review...")
-            da_participants = [
-                {"name": "ProductManager", "role": "Advocate", "model": self.model_config.get_model_name("product_manager")},
-                {"name": "SecurityEngineer", "role": "Critic", "model": self.model_config.get_model_name("security_engineer")},
-                {"name": "CEO", "role": "Judge", "model": self.model_config.get_model_name("ceo")},
-            ]
-            da_outcome = await quick_meeting(
-                topic=f"Devil's Advocate: {problem.description}",
-                participants=da_participants,
-                meeting_type=MeetingType.DEVILS_ADVOCATE,
-                context=f"Initial evaluation: APPROVED\nReasoning: {reasoning}",
-            )
-            self.state.artifacts["devils_advocate"] = {
-                "decision": da_outcome.decision,
-                "votes": da_outcome.votes,
-                "key_insights": da_outcome.key_insights,
-            }
-            if da_outcome.decision and "reject" in da_outcome.decision.lower():
-                console.warning("Devil's advocate overturned initial approval")
-                approved = False
-
-        return approved
 
     # ============================================================
     #  PHASE 5: TECHNICAL DESIGN (CTO)
     # ============================================================
 
-    async def _run_technical_design_phase(self) -> None:
-        """CTO designs the technical architecture."""
-        self.state.phase = WorkflowPhase.TECHNICAL_DESIGN
-        self.structured_logger.info("Technical design phase started")
-
-        problem = self.state.current_problem
-        if not problem:
-            console.error("No problem for technical design")
-            return
-        _analysis = self.state.artifacts.get("problem_analysis", {})  # Available for future use
-
-        # Refine the problem statement before feeding to PM and CTO
-        try:
-            from research.problem_statement_refiner import ProblemStatementRefiner
-            _refiner = ProblemStatementRefiner()
-            _refined = _refiner.refine(problem.description)
-            refined_desc = _refiner.format_refined_statement(_refined)
-            self.state.artifacts["refined_problem"] = refined_desc
-            console.info(
-                f"Problem refined: type={_refined.problem_type.value}, "
-                f"actionable={_refined.is_actionable}, confidence={_refined.confidence:.0%}"
-            )
-            if not _refined.is_actionable:
-                for note in _refined.refinement_notes:
-                    console.warning(f"Problem refinement note: {note}")
-            # Augment the problem dict passed to PM with refined description
-            problem_dict_refined = problem.to_dict()
-            problem_dict_refined["refined_description"] = refined_desc
-        except Exception as _re:
-            console.warning(f"Problem statement refiner failed: {_re}")
-            problem_dict_refined = problem.to_dict()
-
-        # Define requirements
-        console.agent_action("ProductManager", "Defining Requirements", "Creating detailed specifications...")
-        problem_analysis = self.state.artifacts.get("problem_analysis", {})
-        req_task = {
-            "type": "define_requirements",
-            "problem": problem_dict_refined,
-            "target_users": problem.target_users,
-            "market_analysis": str(problem_analysis)[:600] if problem_analysis else ""
-        }
-        req_result = await self.product_manager.execute_task(req_task)
-        self.state.artifacts["requirements"] = req_result.output
-        # Store structured RequirementsDoc alongside raw output
-        req_doc_dict = req_result.artifacts.get("requirements_doc") or (
-            req_result.output.get("requirements_doc") if isinstance(req_result.output, dict) else None
-        )
-        if req_doc_dict:
-            self.state.artifacts["requirements_doc"] = req_doc_dict
-            ac_count = len(req_doc_dict.get("acceptance_criteria", []))
-            console.info(f"RequirementsDoc: {ac_count} acceptance criteria extracted")
-        console.agent_thinking("ProductManager", "Requirements defined")
-        # Track PM experience for requirements definition
-        if hasattr(self.product_manager, '_experience'):
-            self.product_manager._experience.add_experience("define_requirements", req_result.success)
-        self.agent_pool.record_task_outcome("ProductManager", req_result.success)
-
-        # Technical design
-        console.agent_action("CTO", "Designing Architecture", "Creating technical blueprint...")
-        # Handle case where output might be a string instead of dict
-        req_output = req_result.output if isinstance(req_result.output, dict) else {"response": str(req_result.output)}
-        design_task = {
-            "type": "design_architecture",
-            "problem": problem_dict_refined,
-            "requirements": str(req_output.get("requirements", "")),
-            "requirements_doc": self.state.artifacts.get("requirements_doc", {}),
-            "market_analysis": str(problem_analysis)[:400] if problem_analysis else "",
-            "context_messages": self._drain_messages_for_agent("CTO")
-        }
-        # Debate: for complex tasks, run CEO vs CTO debate before finalizing architecture
-        design_prompt = (
-            f"Architecture for: {problem.description}\n\n"
-            f"Requirements: {str(req_output.get('requirements', ''))[:400]}"
-        )
-        compute = self.cto._get_compute_config(design_prompt)
-        if compute["consistency_samples"] >= 5:  # complex task — run debate
-            try:
-                from collaboration.debate import DebateOrchestrator
-                debate = DebateOrchestrator(max_rounds=2)
-                outcome = await debate.run_debate(
-                    agent_a=self.ceo,
-                    agent_b=self.cto,
-                    topic=f"Architecture for: {self.state.current_problem.description}",
-                    synthesizer=self.cto,
-                )
-                self.state.artifacts["architecture_debate"] = outcome.final_position
-                console.info("Architecture debate complete — skipping HyperTree to avoid redundant LLM calls")
-                # Inject debate outcome into the CTO's final design task
-                design_task["requirements"] = (
-                    design_task["requirements"]
-                    + f"\n\nARCHITECTURE DEBATE OUTCOME:\n{outcome.final_position[:1000]}"
-                )
-                # HyperTree is skipped when Debate runs — both fire on complex tasks
-                # and together produce 10+ LLM calls. Debate already covers the same ground.
-            except Exception as _debate_err:
-                console.warning(f"Architecture debate skipped: {_debate_err}")
-
-        design_result = await self.cto.execute_task(design_task)
-        self.state.artifacts["architecture"] = design_result.output
-        # Store structured ArchitectureNote + Stories
-        arch_note_dict = design_result.artifacts.get("architecture_note") or (
-            design_result.output.get("architecture_note") if isinstance(design_result.output, dict) else None
-        )
-        if arch_note_dict:
-            self.state.artifacts["architecture_note"] = arch_note_dict
-            stories = arch_note_dict.get("stories", [])
-            self.state.artifacts["stories"] = stories
-            adr_count = len(arch_note_dict.get("architecture_decisions", []))
-            console.info(f"ArchitectureNote: {adr_count} ADRs, {len(stories)} stories sharded")
-        console.agent_thinking("CTO", "Architecture design complete")
-        # Track CTO experience and pool performance
-        if hasattr(self.cto, '_experience'):
-            self.cto._experience.add_experience("design_architecture", design_result.success)
-        self.agent_pool.record_task_outcome("CTO", design_result.success)
-        self.performance_tracker.record_task(
-            "CTO", success=design_result.success,
-            response_time_ms=design_result.execution_time * 1000, tokens=0
-        )
-        # CTO shares architecture context with Developer via message bus
-        arch_summary = str(design_result.output)[:300] if design_result.output else "Architecture designed"
-        self.message_bus.share_finding("CTO", "Developer", f"Architecture ready: {arch_summary}")
-
-        # Extract root cause from CTO's structured output
-        from utils.output_parser import StructuredOutputParser
-        design_parser = StructuredOutputParser()
-        design_text = design_result.artifacts.get("architecture_doc", "")
-        if not design_text and isinstance(design_result.output, dict):
-            design_text = design_result.output.get("architecture", "")
-        parsed_design = design_parser.parse_cto_design(str(design_text))
-        root_cause = parsed_design.get("root_cause", "")
-        if root_cause:
-            self.state.artifacts["root_cause"] = root_cause
-            console.info(f"Root cause identified: {root_cause}")
-        else:
-            console.warning("CTO did not provide a structured ROOT_CAUSE")
-        # Score root cause depth — ensures deep first-principles thinking
-        rcd_score = design_parser.score_root_cause_depth(root_cause or design_text[:500])
-        self.state.artifacts["root_cause_depth"] = rcd_score
-        console.info(f"Root cause analysis depth: {rcd_score}/4 (1=symptom, 2=proximate, 3=root, 4=systemic)")
-        if rcd_score < 2:
-            console.warning("Shallow root cause analysis — CTO will be prompted for deeper analysis on next redesign")
-            self.state.artifacts["needs_deeper_root_cause"] = True
-
-        # Reflect on CTO architecture design (learning)
-        if self.enable_learning:
-            self.cto.reflect(
-                "design_architecture",
-                str(design_result.output),
-                design_result.success
-            )
-
-        # Feasibility assessment
-        console.agent_action("CTO", "Assessing Feasibility", "Evaluating technical constraints...")
-        design_output = design_result.output if isinstance(design_result.output, dict) else {"response": str(design_result.output)}
-        feasibility_task = {
-            "type": "assess_feasibility",
-            "solution": design_output.get("architecture", ""),
-            "constraints": [],
-            "timeline": "MVP"
-        }
-        feasibility_result = await self.cto.execute_task(feasibility_task)
-        self.state.artifacts["feasibility"] = feasibility_result.output
-
-        # Handle case where output might be a string instead of dict
-        feas_output = feasibility_result.output if isinstance(feasibility_result.output, dict) else {"response": str(feasibility_result.output)}
-        feasibility = feas_output.get('feasibility', 'unknown')
-        console.success(f"Feasibility Assessment: {feasibility}")
-
-        # Create execution plan for remaining phases via PlanManager
-        exec_plan = self.plan_manager.create_plan(
-            name=f"solution-{problem.id}",
-            description=f"Execution plan for: {problem.description}",
-            tags=["auto-generated"],
-        )
-        exec_plan.add_step("Implementation", "Implement the solution based on architecture")
-        exec_plan.add_step("Code Execution", "Run and verify generated code")
-        exec_plan.add_step("QA Validation", "Validate solution quality")
-        exec_plan.add_step("CEO Approval", "Get final approval from CEO")
-        exec_plan.add_step("Delivery", "Package and deliver the solution")
-        self.plan_manager.approve_plan(exec_plan, approved_by="CTO")
-        self.plan_manager.start_execution(exec_plan)
-        self.state.artifacts["execution_plan"] = exec_plan.to_dict()
-        console.info(f"Execution plan created: {exec_plan.name} ({len(exec_plan.steps)} steps)")
 
     # ============================================================
     #  PHASE 7: IMPLEMENTATION (DEVELOPER)
     # ============================================================
 
-    async def _run_implementation_phase(self) -> None:
-        """Developer implements the solution."""
-        self.state.phase = WorkflowPhase.IMPLEMENTATION
-        self.structured_logger.info("Implementation phase started")
-
-        # Track plan step
-        if self.plan_manager.current_plan:
-            self.plan_manager.start_step("step_1")
-
-        problem = self.state.current_problem
-        if not problem:
-            console.error("No problem for implementation")
-            return
-
-        architecture = self.state.artifacts.get("architecture", {})
-        requirements = self.state.artifacts.get("requirements", {})
-
-        # Get language from problem metadata (default to python)
-        language = problem.metadata.get("language", "python")
-        self.state.artifacts["language"] = language
-        console.info(f"Target language: {language}")
-
-        # Determine project location
-        # "Direct output" mode: output_dir is "." or matches workspace_root
-        # In this mode, files go directly into the target directory (like Claude Code)
-
-        is_direct_output = (
-            self.output_dir == "."
-            or Path(self.output_dir).resolve() == Path(self.workspace_root).resolve()
-        )
-
-        if is_direct_output:
-            # Direct output mode - like Claude Code, files go into workspace_root
-            project_name = str(Path(self.workspace_root).resolve())
-            console.info(f"Generating files in: {project_name} (Claude Code style)")
-        else:
-            # Isolated project mode - create a subfolder per solution
-            project_name = f"{self.output_dir}/solution_{problem.id}"
-            console.info(f"Output folder: {project_name}/")
-
-        # Store project_name so QA feedback loop can reference it
-        self.state.artifacts["project_name"] = project_name
-
-        # Create project
-        console.agent_action("Developer", "Creating Project", f"Setting up {language} project structure...")
-        create_task = {
-            "type": "create_project",
-            "name": project_name,
-            "project_type": language,  # Use the target language
-            "description": problem.description,
-            "features": problem.potential_solution_ideas,
-            "output_dir": project_name
-        }
-        create_result = await self.developer.execute_task(create_task)
-        self.state.artifacts["project"] = create_result.output
-
-        # Handle case where output might be a string instead of dict
-        create_output = create_result.output if isinstance(create_result.output, dict) else {"response": str(create_result.output)}
-        files_created = create_output.get('files_created', [])
-        console.success(f"Project created with {len(files_created)} files")
-
-        # Implement feature
-        console.agent_action("Developer", "Implementing Features", "Writing code based on specifications...")
-        # Handle case where architecture might be a string instead of dict
-        arch_data = architecture if isinstance(architecture, dict) else {"response": str(architecture)}
-        time_context = self._get_time_context()
-        spec_text = str(requirements)
-        if time_context:
-            spec_text = f"{time_context}\n{spec_text}"
-        impl_task = {
-            "type": "implement_feature",
-            "specification": spec_text,
-            "architecture": str(arch_data.get("architecture", "")),
-            "file_structure": {},
-            "language": language,
-            "output_dir": project_name,
-            "stories": self.state.artifacts.get("stories", []),
-            "requirements_doc": self.state.artifacts.get("requirements_doc", {}),
-            "context_messages": self._drain_messages_for_agent("Developer")
-        }
-        impl_result = await self.developer.execute_task(impl_task)
-        # Wire first_principles_score from agent onto TaskResult
-        impl_result.first_principles_score = getattr(self.developer, '_last_fp_score', 1.0)
-        self.state.artifacts["implementation"] = impl_result.output
-        self.state.artifacts["impl_fp_score"] = impl_result.first_principles_score
-
-        # RAG: index this implementation for future retrieval
-        if self.state.artifacts.get("implementation"):
-            impl_summary = str(self.state.artifacts["implementation"])[:2000]
-            self.rag_store.add(
-                content=f"Problem: {self.state.current_problem.description}\n\nSolution:\n{impl_summary}",
-                tags=[self.state.current_problem.domain],
-                source="solution"
-            )
-        if impl_result.first_principles_score < 0.6:
-            console.warning(
-                f"Developer first-principles compliance LOW ({impl_result.first_principles_score:.0%}). "
-                "Solution may be a surface-level fix rather than addressing root cause."
-            )
-
-        # Parse developer confidence score from response text
-        import re as _re_conf
-        _impl_text = str(impl_result.output)
-        _conf_match = _re_conf.search(r'CONFIDENCE:\s*([0-9]\.[0-9]+)', _impl_text, _re_conf.IGNORECASE)
-        dev_confidence = float(_conf_match.group(1)) if _conf_match else None
-        if dev_confidence is not None:
-            self.state.artifacts["developer_confidence"] = dev_confidence
-            if dev_confidence < 0.6:
-                console.warning(
-                    f"Developer self-reported CONFIDENCE={dev_confidence:.0%}. "
-                    "QA should focus extra attention on flagged uncertain areas."
-                )
-            else:
-                console.info(f"Developer confidence: {dev_confidence:.0%}")
-
-        # Handle case where output might be a string instead of dict
-        impl_output = impl_result.output if isinstance(impl_result.output, dict) else {"response": str(impl_result.output)}
-        impl_files = impl_output.get('files_written', [])
-        console.success(f"Implementation complete - {len(impl_files)} files written")
-
-        # Reflect on implementation (learning)
-        if self.enable_learning:
-            self.developer.reflect(
-                "implement_feature",
-                str(impl_result.output),
-                impl_result.success
-            )
-
-        # Complete plan step
-        if self.plan_manager.current_plan:
-            self.plan_manager.complete_step("step_1", output="Implementation complete")
 
     # ============================================================
     #  PHASE 9-10: QA + SECURITY VALIDATION + CEO APPROVAL LOOP
     # ============================================================
 
-    async def _run_qa_phase(self) -> bool:
-        """QA Engineer validates the solution with a review meeting."""
-        self.state.phase = WorkflowPhase.QA_VALIDATION
-        self.structured_logger.info("QA validation phase started")
 
-        # Track plan step (step_3 = QA Validation)
-        if self.plan_manager.current_plan:
-            self.plan_manager.start_step("step_3")
-
-        problem = self.state.current_problem
-        if not problem:
-            console.error("No problem for QA phase")
-            return False
-
-        implementation = self.state.artifacts.get("implementation", {})
-        requirements = self.state.artifacts.get("requirements", {})
-
-        # Create test plan
-        test_plan_task = {
-            "type": "create_test_plan",
-            "feature": {
-                "name": problem.description,
-                "description": problem.description
-            },
-            "requirements": str(requirements)
-        }
-        test_plan_result = await self.qa_engineer.execute_task(test_plan_task)
-        self.state.artifacts["test_plan"] = test_plan_result.output
-
-        # Hold a review meeting
-        review_participants = [
-            {
-                "name": "QAEngineer",
-                "role": "Quality Assurance",
-                "model": self.model_config.get_model_name("qa_engineer")
-            },
-            {
-                "name": "Developer",
-                "role": "Implementation",
-                "model": self.model_config.get_model_name("developer")
-            },
-            {
-                "name": "CTO",
-                "role": "Technical Review",
-                "model": self.model_config.get_model_name("cto")
-            }
-        ]
-
-        execution_results = self.state.artifacts.get("execution_results", {})
-        execution_summary = execution_results.get("summary", "Not run")
-
-        dev_confidence = self.state.artifacts.get("developer_confidence")
-        confidence_note = (
-            f"\nDeveloper Self-Confidence: {dev_confidence:.0%} — "
-            "FOCUS testing on areas the developer flagged as uncertain."
-            if dev_confidence is not None and dev_confidence < 0.75 else ""
-        )
-
-        cto_peer_review = self.state.artifacts.get("cto_peer_review", "")
-        cto_peer_note = f"\nCTO Peer Review Issues: {cto_peer_review[:400]}" if cto_peer_review else ""
-        review_context = f"""
-Problem Solved: {problem.description}
-Requirements: {str(requirements)}
-Implementation Summary: {str(implementation)}
-Test Plan: {str(test_plan_result.output)}
-Code Execution Results: {execution_summary}{confidence_note}{cto_peer_note}
-"""
-        if self.enable_meetings:
-            review_outcome = await quick_meeting(
-                topic="Code Review and Quality Assessment",
-                participants=review_participants,
-                meeting_type=MeetingType.REVIEW,
-                context=review_context
-            )
-
-            self.state.artifacts["qa_review_meeting"] = {
-                "decision": review_outcome.decision,
-                "votes": review_outcome.votes,
-                "action_items": review_outcome.action_items
-            }
-
-            # Store meeting in shared memory
-            self.shared_memory.store_meeting(
-                topic="Code Review and Quality Assessment",
-                participants=["QAEngineer", "Developer", "CTO"],
-                summary=review_outcome.decision,
-                action_items=review_outcome.action_items
-            )
-            review_feedback = review_outcome.decision
-        else:
-            console.info("Meetings disabled — skipping QA review meeting")
-            review_feedback = "Review meeting skipped (meetings disabled)"
-            review_outcome = None
-            self.state.artifacts["qa_review_meeting"] = {"decision": review_feedback, "meetings_disabled": True}
-
-        # Determine review depth based on trust between QA and Developer
-        review_depth = self.trust_tracker.get_review_threshold("QAEngineer", "Developer")
-        depth_instructions = {
-            "light": "Quick review — focus on critical functionality only. The developer has a strong track record.",
-            "standard": "Standard review — check functionality and code quality.",
-            "thorough": "Deep review — check edge cases, error handling, and logic flow. Previous work had quality issues.",
-        }
-        depth_note = depth_instructions.get(review_depth, depth_instructions["standard"])
-        console.info(f"Review depth: {review_depth}")
-
-        # Part 4b: Include root cause context for QA verification
-        root_cause = self.state.artifacts.get("root_cause", "")
-        qa_requirements_str = str(requirements)
-        if root_cause:
-            qa_requirements_str += f"\n\nVerify the implementation addresses this root cause: {root_cause}"
-
-        # Validate solution
-        dev_confidence_val = self.state.artifacts.get("developer_confidence")
-        validation_task = {
-            "type": "validate_solution",
-            "solution": {
-                "description": problem.description,
-                "implementation": str(implementation)
-            },
-            "requirements": qa_requirements_str,
-            "requirements_doc": self.state.artifacts.get("requirements_doc", {}),
-            "problem": problem.to_dict(),
-            "review_feedback": review_feedback,
-            "review_depth": review_depth,
-            "review_depth_instruction": depth_note,
-            "execution_results": self.state.artifacts.get("execution_results", {}),
-            "developer_confidence": dev_confidence_val,
-            "cto_peer_review": cto_peer_review,
-            "context_messages": self._drain_messages_for_agent("QAEngineer")
-        }
-        validation_result = await self.qa_engineer.execute_task(validation_task)
-        # Wire first_principles_score from QA onto result
-        validation_result.first_principles_score = getattr(self.qa_engineer, '_last_fp_score', 1.0)
-        self.state.artifacts["qa_fp_score"] = validation_result.first_principles_score
-        self.state.artifacts["qa_validation"] = validation_result.output
-        # Store typed QAReport if produced
-        if isinstance(validation_result.output, dict) and "qa_report" in validation_result.output:
-            self.state.artifacts["qa_report_typed"] = validation_result.output["qa_report"]
-            qa_report_dict = validation_result.output["qa_report"]
-            passed = len([r for r in qa_report_dict.get("criterion_results", []) if r.get("status") == "PASS"])
-            total = len(qa_report_dict.get("criterion_results", []))
-            if total:
-                console.info(f"QAReport: {passed}/{total} acceptance criteria passed")
-
-        # Generate QA report (execution_results already fetched above)
-        report_task = {
-            "type": "generate_qa_report",
-            "project": problem.id,
-            "test_results": test_plan_result.output,
-            "issues": review_outcome.action_items if review_outcome else [],
-            "execution_results": execution_results
-        }
-        report_result = await self.qa_engineer.execute_task(report_task)
-        self.state.artifacts["qa_report"] = report_result.output
-
-        # Handle case where output might be a string instead of dict
-        qa_output = validation_result.output if isinstance(validation_result.output, dict) else {"response": str(validation_result.output)}
-        verdict = qa_output.get("verdict", "fail")
-        if self.enable_meetings and review_outcome:
-            approvals = sum(1 for v in review_outcome.votes.values() if v == "approve")
-            console.info(f"Review Meeting Approvals: {approvals}/{len(review_outcome.votes)}")
-        console.info(f"QA Verdict: {verdict.upper()}")
-
-        # Track performance: QA task and Developer's work quality
-        qa_passed = verdict in ["pass", "pass_with_issues"]
-        self.performance_tracker.record_task(
-            "QAEngineer", success=True,
-            response_time_ms=validation_result.execution_time * 1000,
-            tokens=0
-        )
-        self.performance_tracker.record_approval("Developer", approved=qa_passed)
-        if not qa_passed:
-            self.performance_tracker.record_rework("Developer")
-
-        # Update trust: QA reviewed Developer's work
-        # High-confidence reviews are a stronger signal for trust
-        qa_confidence = validation_result.confidence
-        if qa_confidence >= CONFIDENCE_HIGH:
-            self.trust_tracker.update_trust("QAEngineer", "Developer", positive=qa_passed)
-        else:
-            self.trust_tracker.update_trust("QAEngineer", "Developer", positive=qa_passed)
-
-        # Update experience
-        if hasattr(self.qa_engineer, '_experience'):
-            self.qa_engineer._experience.add_experience("validate_solution", True)
-        if hasattr(self.developer, '_experience'):
-            self.developer._experience.add_experience("implementation", qa_passed)
-
-        # Graduated confidence response (OrgChart integration)
-        if qa_confidence < CONFIDENCE_CRITICAL:
-            supervisor = self.org_chart.get_supervisor("QAEngineer")
-            console.warning(f"QA confidence CRITICAL ({qa_confidence:.2f}) — supervisor {supervisor} will re-review")
-            self.performance_tracker.record_task("QAEngineer", success=False, response_time_ms=0, tokens=0)
-        elif qa_confidence < CONFIDENCE_LOW:
-            supervisor = self.org_chart.get_supervisor("QAEngineer")
-            if supervisor:
-                console.info(f"QA confidence low ({qa_confidence:.2f}) — supervisor {supervisor} notified")
-        elif qa_confidence >= CONFIDENCE_HIGH:
-            console.info(f"QA high-confidence verdict ({qa_confidence:.2f})")
-
-        # Reflect on QA validation (learning)
-        if self.enable_learning:
-            self.qa_engineer.reflect(
-                "validate_solution",
-                str(validation_result.output),
-                qa_passed
-            )
-
-        # Update plan step
-        if self.plan_manager.current_plan:
-            if qa_passed:
-                self.plan_manager.complete_step("step_3", output=f"QA verdict: {verdict}")
-            else:
-                self.plan_manager.fail_step("step_3", error=f"QA verdict: {verdict}")
-
-        return qa_passed
-
-    async def _run_ceo_approval(self) -> bool:
-        """CEO gives final approval."""
-        self.state.phase = WorkflowPhase.CEO_APPROVAL
-        self.structured_logger.info("CEO approval phase started")
-
-        # Track plan step (step_4 = CEO Approval)
-        if self.plan_manager.current_plan:
-            self.plan_manager.start_step("step_4")
-
-        problem = self.state.current_problem
-        if not problem:
-            console.error("No problem for CEO approval")
-            return False
-
-        execution_results = self.state.artifacts.get("execution_results", {})
-        execution_summary = execution_results.get("summary", "Not run")
-        # Include DevOps verdict in CEO context
-        devops_validation = self.state.artifacts.get("devops_validation", "Not run")
-        devops_summary = str(devops_validation)[:500] if devops_validation else "Not run"
-        # Include Security review findings
-        security_review = self.state.artifacts.get("security_review", None)
-        security_summary = str(security_review)[:500] if security_review else "Not run"
-
-        impl_fp = self.state.artifacts.get("impl_fp_score", 1.0)
-        qa_fp = self.state.artifacts.get("qa_fp_score", 1.0)
-        quality_score = execution_results.get("quality_score", "N/A")
-        quality_details = execution_results.get("quality_details", {})
-        quality_str = (
-            f"Quality={quality_score:.0%} "
-            f"(TODOs={quality_details.get('todo_count',0)}, "
-            f"long_funcs={quality_details.get('long_functions',0)}, "
-            f"hardcoded={quality_details.get('hardcoded_values',0)})"
-            if isinstance(quality_score, float) else f"Quality=N/A"
-        )
-        approval_task = {
-            "type": "approve_solution",
-            "solution": {
-                "description": problem.description,
-                "implementation": str(self.state.artifacts.get("implementation", {}))
-            },
-            "qa_report": str(self.state.artifacts.get("qa_report", {})),
-            "security_report": security_summary,
-            "original_problem": problem.to_dict(),
-            "execution_summary": (
-                f"{execution_summary}\nDevOps Validation: {devops_summary}\n"
-                f"Security Review: {security_summary}\n"
-                f"First-Principles Scores: Developer={impl_fp:.0%}, QA={qa_fp:.0%}\n"
-                f"Code {quality_str}"
-            ),
-            "root_cause": self.state.artifacts.get("root_cause", ""),
-        }
-        result = await self.ceo.execute_task(approval_task)
-
-        # Handle case where output might be a string instead of dict
-        output = result.output if isinstance(result.output, dict) else {"response": str(result.output)}
-        decision = output.get("decision", "rejected")
-        reasoning = output.get("reasoning", "")
-        self.state.decisions.append({
-            "phase": "final_approval",
-            "decision": decision,
-            "reasoning": reasoning
-        })
-
-        self.state.artifacts["final_approval"] = result.output
-        console.info(f"Final Approval: {decision.upper()}")
-
-        # Track performance: CEO task and Developer approval
-        approved = decision == "approved"
-        self.performance_tracker.record_task(
-            "CEO", success=True,
-            response_time_ms=result.execution_time * 1000,
-            tokens=0
-        )
-        self.performance_tracker.record_approval("Developer", approved=approved)
-        if not approved:
-            self.performance_tracker.record_rework("Developer")
-        # Track CEO experience and pool performance
-        if hasattr(self.ceo, '_experience'):
-            self.ceo._experience.add_experience("approve_solution", approved)
-        self.agent_pool.record_task_outcome("CEO", approved)
-        # Reflect on CEO approval decision (learning)
-        if self.enable_learning:
-            self.ceo.reflect(
-                "approve_solution",
-                str(result.output),
-                approved
-            )
-
-        # Update trust: CEO reviewed Developer's work
-        self.trust_tracker.update_trust("CEO", "Developer", positive=approved)
-
-        # Graduated confidence response (OrgChart integration)
-        ceo_confidence = result.confidence
-        if ceo_confidence < CONFIDENCE_CRITICAL:
-            console.warning(f"CEO confidence CRITICAL ({ceo_confidence:.2f}) — decision may be unreliable")
-        elif ceo_confidence < CONFIDENCE_LOW and not approved:
-            console.info(f"CEO confidence low ({ceo_confidence:.2f}) — reviewing rejection reasoning")
-        elif ceo_confidence >= CONFIDENCE_HIGH and approved:
-            console.info(f"CEO high-confidence approval ({ceo_confidence:.2f})")
-
-        # Update plan step
-        if self.plan_manager.current_plan:
-            if approved:
-                self.plan_manager.complete_step("step_4", output=f"CEO: {decision}")
-            else:
-                self.plan_manager.fail_step("step_4", error=f"CEO: {decision} - {reasoning}")
-
-        return approved
 
     # ============================================================
     #  ESCALATION STRATEGIES
     # ============================================================
 
-    async def _team_brainstorm(self) -> Optional[Dict[str, Any]]:
-        """All agents brainstorm solutions for a stuck problem.
 
-        Uses a brainstorm meeting with CTO, PM, and Developer to
-        generate fresh ideas, then picks the most promising one.
-        """
-        from collaboration.meeting import AgentMeeting
-        from collaboration.meeting import MeetingType as MT
-        problem = self.state.current_problem
-        if not problem:
-            return None
 
-        strategy_context = self.escalation_manager.strategy_memory.summarize_for_next_attempt()
-
-        meeting = AgentMeeting(MT.BRAINSTORM, f"Brainstorm solutions for: {problem.description}")
-        meeting.add_participant("CTO", "cto", self.model_config.get_model_name("cto"))
-        meeting.add_participant("ProductManager", "product_manager", self.model_config.get_model_name("product_manager"))
-        meeting.add_participant("Developer", "developer", self.model_config.get_model_name("developer"))
-
-        context = (
-            f"Problem: {problem.description}\n"
-            f"Previous attempts have failed.\n{strategy_context}\n"
-            f"We need a DIFFERENT approach. Think creatively."
-        )
-        outcome = await meeting.run(context)
-
-        # Record in strategy memory
-        self.escalation_manager.strategy_memory.record_attempt(
-            approach="team_brainstorm", round=len(self.escalation_manager.history),
-            outcome="brainstorm_complete",
-            feedback=str(outcome.key_insights[:3]) if outcome.key_insights else ""
-        )
-
-        # Use brainstorm ideas to inform next design
-        if outcome.key_insights:
-            brainstorm_ideas = "\n".join(outcome.key_insights[:5])
-            redesign_task = {
-                "type": "design_architecture",
-                "problem": problem.to_dict(),
-                "requirements": str(self.state.artifacts.get("requirements", "")),
-                "constraint": f"Use these brainstormed ideas as inspiration:\n{brainstorm_ideas}"
-            }
-            redesign_result = await self.cto.execute_task(redesign_task)
-            self.state.artifacts["architecture"] = redesign_result.output
-            return {"ideas": outcome.key_insights, "new_architecture": redesign_result.output}
-
-        return None
-
-    async def _decompose_problem(self) -> Optional[List[Dict]]:
-        """Break an unsolvable problem into smaller sub-problems.
-
-        Uses PM to identify independently-solvable pieces.
-        """
-        problem = self.state.current_problem
-        if not problem:
-            return None
-
-        strategy_context = self.escalation_manager.strategy_memory.summarize_for_next_attempt()
-
-        decompose_task = {
-            "type": "define_requirements",
-            "problem": problem.to_dict(),
-            "target_users": problem.target_users,
-            "constraint": (
-                f"The full problem has proven too complex to solve in one attempt.\n"
-                f"{strategy_context}\n\n"
-                f"Break it into 2-3 INDEPENDENT sub-problems that can each be solved separately.\n"
-                f"Each sub-problem should be self-contained and testable on its own.\n"
-                f"Focus on the MINIMUM viable solution for each sub-problem."
-            )
-        }
-        decompose_result = await self.product_manager.execute_task(decompose_task)
-
-        # Record in strategy memory
-        self.escalation_manager.strategy_memory.record_attempt(
-            approach="decompose_problem",
-            round=len(self.escalation_manager.history),
-            outcome="decomposed",
-            feedback=str(decompose_result.output) if decompose_result.output else ""
-        )
-
-        # Use decomposed requirements for next implementation
-        self.state.artifacts["requirements"] = decompose_result.output
-        await self._run_technical_design_phase()
-
-        return [{"decomposed_requirements": decompose_result.output}]
-
-    async def _pivot_approach(self) -> None:
-        """Try a completely different technical approach.
-
-        CTO proposes alternative architectures/tech stacks.
-        Strategy memory ensures we don't repeat failed approaches.
-        """
-        problem = self.state.current_problem
-        if not problem:
-            return
-
-        strategy_context = self.escalation_manager.strategy_memory.summarize_for_next_attempt()
-        tried_archs = self.escalation_manager.strategy_memory.tried_architectures
-
-        pivot_task = {
-            "type": "design_architecture",
-            "problem": problem.to_dict(),
-            "requirements": str(self.state.artifacts.get("requirements", "")),
-            "constraint": (
-                f"ALL previous approaches have failed. You MUST propose a COMPLETELY "
-                f"different technical approach.\n\n"
-                f"{strategy_context}\n\n"
-                f"Previously tried architectures: {', '.join(tried_archs) if tried_archs else 'None recorded'}\n\n"
-                f"Consider: different language, different framework, simpler architecture, "
-                f"different data structures, or a fundamentally different algorithm.\n"
-                f"Do NOT reuse any approach that has already been tried."
-            )
-        }
-        pivot_result = await self.cto.execute_task(pivot_task)
-        self.state.artifacts["architecture"] = pivot_result.output
-
-        # Record in strategy memory
-        arch_desc = str(pivot_result.output) if pivot_result.output else "unknown"
-        self.escalation_manager.strategy_memory.record_architecture(arch_desc)
-        self.escalation_manager.strategy_memory.record_attempt(
-            approach="pivot_approach",
-            round=len(self.escalation_manager.history),
-            outcome="pivoted",
-            feedback=arch_desc
-        )
 
     # ============================================================
     #  HELPER METHODS
@@ -3151,96 +1917,10 @@ Code Execution Results: {execution_summary}{confidence_note}{cto_peer_note}
         "DevOpsEngineer": 0.05, "DataAnalyst": 0.05, "SecurityEngineer": 0.05,
     }
 
-    def _check_token_budget(self, agent_name: str) -> int:
-        """Return adjusted max_tokens based on remaining agent budget."""
-        session = self.cost_tracker.get_current_session()
-        if not session or not getattr(self.cost_tracker, '_budget_tokens', None):
-            return 4096  # No budget set
-        budget_pct = self._TOKEN_BUDGETS.get(agent_name, 0.10)
-        agent_budget = int(self.cost_tracker._budget_tokens * budget_pct)
-        agent_summary = session.agents.get(agent_name)
-        used = agent_summary.total_tokens if agent_summary else 0
-        remaining = agent_budget - used
-        if remaining < 512:
-            console.warning(f"{agent_name} near token budget ({used}/{agent_budget})")
-            return 512  # Minimum viable response
-        return min(4096, remaining)
 
-    def _get_time_context(self) -> str:
-        """Get time budget context for agent prompts."""
-        if not self.max_workflow_minutes or not self.state.started_at:
-            return ""
-        elapsed = (datetime.now() - self.state.started_at).total_seconds() / 60
-        remaining = self.max_workflow_minutes - elapsed
-        if remaining < 5:
-            return "[TIME CRITICAL: <5 min remaining. Simplest viable solution only.]"
-        elif remaining < 15:
-            return f"[Time remaining: {remaining:.0f}min. Prioritize core functionality.]"
-        return ""
 
-    def _detect_failure_owner(self, feedback: str) -> str:
-        """Determine which agent 'owns' the failure based on feedback content."""
-        feedback_lower = feedback.lower()
-        if any(w in feedback_lower for w in ["requirement", "scope", "feature missing", "spec"]):
-            return "ProductManager"
-        if any(w in feedback_lower for w in ["architecture", "design", "structure", "pattern"]):
-            return "CTO"
-        if any(w in feedback_lower for w in ["security", "vulnerability", "injection", "secret"]):
-            return "SecurityEngineer"
-        return "Developer"
 
-    def _adjust_agent_behavior(self) -> None:
-        """Adjust agent parameters based on KPI performance from previous runs.
 
-        Called at workflow start. Uses PerformanceTracker data to:
-        - Lower temperature for underperformers (make more conservative)
-        - Increase temperature for high performers (allow more creativity)
-        - Add supervision note for agents with low scores
-        - Log adjustments for transparency
-        """
-        all_kpis = self.performance_tracker.get_all_kpis()
-        if not all_kpis:
-            return  # No historical data yet
-
-        for agent_name, kpis in all_kpis.items():
-            score = kpis.calculate_score()
-            agent = self.agents.get(agent_name)
-            if not agent:
-                continue
-
-            if score < 40:
-                # Underperformer: lower temperature, use reconfiguration recommendation
-                agent.config.temperature = max(0.1, agent.config.temperature - 0.15)
-                from company.organization import AgentManager
-                recommendation = AgentManager.recommend_reconfiguration(agent_name, score)
-                agent._supervision_note = (
-                    f"Performance score: {score:.0f}/100. {recommendation}"
-                )
-                console.info(f"Reconfiguration for {agent_name}: {recommendation}")
-                self.structured_logger.info(
-                    f"Adjusted {agent_name}: temp lowered to {agent.config.temperature:.2f} (score={score:.0f})"
-                )
-            elif score > 80:
-                # High performer: slight temp boost for creativity
-                agent.config.temperature = min(1.0, agent.config.temperature + 0.05)
-                self.structured_logger.info(
-                    f"Adjusted {agent_name}: temp raised to {agent.config.temperature:.2f} (score={score:.0f})"
-                )
-
-    def _drain_messages_for_agent(self, agent_name: str) -> str:
-        """Drain pending messages and return summary for agent context."""
-        pending = self.message_bus.peek_messages(agent_name)
-        if pending == 0:
-            return ""
-        msgs = self.message_bus.get_messages(agent_name, limit=5)
-        if not msgs:
-            return ""
-        lines = []
-        for msg in msgs:
-            sender = getattr(msg, 'sender', 'unknown')
-            content = getattr(msg, 'content', str(msg))
-            lines.append(f"From {sender}: {content}")
-        return "Pending team messages:\n" + "\n".join(lines)
 
     async def _run_ceo_morning_brief(self, problem) -> None:
         """CEO sets 2-3 priorities and constraints for the run.
@@ -3336,40 +2016,6 @@ Code Execution Results: {execution_summary}{confidence_note}{cto_peer_note}
             for blocker in standup_minutes.blockers:
                 console.warning(f"  BLOCKER: {blocker[:200]}")
 
-    def _load_previous_learnings(self) -> None:
-        """Load retrospective action items from shared memory into agent context."""
-        from memory.shared_memory import MemoryType
-        retro_memories = self.shared_memory.get_by_type(MemoryType.MEETING)
-        # Filter for retrospectives
-        retro_mems = [m for m in retro_memories if "retrospective" in m.content.lower()]
-        if not retro_mems:
-            return
-        # Take most recent 3
-        retro_mems.sort(key=lambda m: m.created_at, reverse=True)
-        lessons = []
-        for mem in retro_mems[:3]:
-            items = mem.metadata.get("action_items", [])
-            lessons.extend(items[:3])
-        if not lessons:
-            return
-        lessons_text = "\n".join(f"- {l}" for l in lessons[:8])
-        for agent in self.agents.values():
-            agent._retrospective_lessons = lessons_text
-        console.info(f"Loaded {len(lessons[:8])} lessons from past retrospectives")
-
-        # Also load learning system insights from past runs
-        insight_memories = self.shared_memory.get_by_type(MemoryType.INSIGHT)
-        learning_insights = [m for m in insight_memories if "learning" in (m.tags or [])]
-        if learning_insights:
-            learning_insights.sort(key=lambda m: m.created_at, reverse=True)
-            for mem in learning_insights[:3]:
-                agent_name = mem.created_by
-                if agent_name in self.agents:
-                    existing = getattr(self.agents[agent_name], '_retrospective_lessons', '') or ''
-                    self.agents[agent_name]._retrospective_lessons = (
-                        existing + f"\n{mem.content}"
-                    )
-            console.info(f"Loaded {min(3, len(learning_insights))} learning insights from past runs")
 
     async def _run_performance_reviews(self) -> None:
         """Run 1:1 meetings for underperforming agents."""
@@ -3418,646 +2064,18 @@ Code Execution Results: {execution_summary}{confidence_note}{cto_peer_note}
     #  DELIVERY + RETROSPECTIVE
     # ============================================================
 
-    async def _run_delivery_phase(self) -> Dict[str, Any]:
-        """Package the approved solution for delivery."""
-        self.structured_logger.info("Delivery phase started")
-
-        # Track plan step (step_5 = Delivery)
-        if self.plan_manager.current_plan:
-            self.plan_manager.start_step("step_5")
-
-        project_dir = self.state.artifacts.get("project_name", self.output_dir)
-        project_path = Path(project_dir)
-        problem = self.state.current_problem
-
-        # Generate README via Developer
-        readme_task = {
-            "type": "implement_feature",
-            "specification": (
-                f"Create a README.md file for this project.\n"
-                f"Project: {problem.description}\n"
-                f"Include: Overview, Installation, Usage, Architecture.\n"
-                f"Keep it concise and practical."
-            ),
-            "architecture": str(self.state.artifacts.get("architecture", "")),
-            "file_structure": {},
-            "language": self.state.artifacts.get("language", "python"),
-            "output_dir": project_dir
-        }
-        await self.developer.execute_task(readme_task)
-
-        # Generate Dockerfile for easy deployment
-        language = self.state.artifacts.get("language", "python")
-        dockerfile_task = {
-            "type": "implement_feature",
-            "specification": (
-                f"Create a Dockerfile for this {language} project.\n"
-                f"Project: {problem.description}\n"
-                f"Requirements:\n"
-                f"- Use a slim/alpine base image for {language}\n"
-                f"- Install dependencies (requirements.txt or package.json if present)\n"
-                f"- Set the correct WORKDIR and ENTRYPOINT\n"
-                f"- Add a .dockerignore file excluding .git, __pycache__, node_modules, venv, .env\n"
-                f"- Keep it simple and production-ready\n"
-                f"Output ONLY the Dockerfile and .dockerignore files."
-            ),
-            "architecture": "",
-            "file_structure": {},
-            "language": language,
-            "output_dir": project_dir
-        }
-        try:
-            await self.developer.execute_task(dockerfile_task)
-            console.success("Dockerfile generated for easy deployment")
-        except Exception as e:
-            console.warning(f"Dockerfile generation skipped: {e}")
-
-        # Format generated code before delivery
-        from tools.code_formatter import CodeFormatter
-        try:
-            formatter = CodeFormatter(timeout=30)
-            format_result = formatter.format_directory(
-                project_dir,
-                recursive=True,
-                exclude_patterns=["node_modules", "__pycache__", ".git", "venv", ".venv", ".deps", "dist", "build"]
-            )
-            if format_result.files_formatted:
-                console.success(f"Formatted {len(format_result.files_formatted)} files")
-            if format_result.errors:
-                for err in format_result.errors[:3]:
-                    console.warning(f"Format warning: {err}")
-        except Exception as e:
-            console.warning(f"Code formatting skipped: {e}")
-
-        # Initialize git repository for the delivered project
-        try:
-            project_git = GitTools(repo_path=project_dir)
-            if not project_git.is_repo():
-                import subprocess as _sp
-                _sp.run(["git", "init"], cwd=project_dir, capture_output=True, timeout=10)
-                project_git.stage_all()
-                project_git.commit(
-                    message=f"feat: initial solution for {problem.description}",
-                    add_co_author=True,
-                )
-                console.success("Git repository initialized with initial commit")
-            else:
-                console.info("Git repository already exists, skipping init")
-        except Exception as git_err:
-            console.warning(f"Git init skipped: {git_err}")
-
-        # Install dependencies for the delivered project
-        import subprocess as _sub
-        try:
-            req_file = project_path / "requirements.txt"
-            pkg_file = project_path / "package.json"
-            if req_file.exists():
-                console.info("Installing Python dependencies...")
-                _sub.run(
-                    ["python3", "-m", "pip", "install", "-q", "-r", str(req_file)],
-                    capture_output=True, text=True, timeout=120, cwd=project_dir
-                )
-                console.success("Python dependencies installed")
-            elif pkg_file.exists():
-                console.info("Installing Node.js dependencies...")
-                npm_cmd = "npm" if _sub.run(["which", "npm"], capture_output=True).returncode == 0 else None
-                if npm_cmd:
-                    _sub.run(
-                        ["npm", "install", "--silent"],
-                        capture_output=True, text=True, timeout=120, cwd=project_dir
-                    )
-                    console.success("Node.js dependencies installed")
-                else:
-                    console.warning("npm not found, skipping dependency install")
-        except Exception as dep_err:
-            console.warning(f"Dependency installation skipped: {dep_err}")
-
-        # Build delivery summary
-        delivery = {
-            "project_dir": project_dir,
-            "problem": problem.description,
-            "language": self.state.artifacts.get("language", "python"),
-            "files": [str(f.relative_to(project_path))
-                      for f in self._filter_project_files(list(project_path.rglob("*")))
-                      if f.is_file()] if project_path.exists() else [],
-            "execution_status": self.state.artifacts.get("execution_results", {}).get("summary", "Not run"),
-        }
-
-        self.state.artifacts["delivery"] = delivery
-
-        # Complete plan step
-        if self.plan_manager.current_plan:
-            self.plan_manager.complete_step("step_5", output=f"Delivered {len(delivery.get('files', []))} files")
-
-        return delivery
 
     # ============================================================
     #  PHASE 2: DATA ANALYSIS
     # ============================================================
 
-    async def _run_data_analysis_phase(self) -> None:
-        """DataAnalyst cross-validates, deduplicates, and detects bias in research findings."""
-        self.state.phase = WorkflowPhase.DATA_ANALYSIS
-        self.structured_logger.info("Data analysis phase started")
-
-        problems = self.state.artifacts.get("discovered_problems", [])
-        if not problems:
-            console.info("No discovered problems to analyze, skipping data analysis")
-            return
-
-        # Step 1: Deduplicate
-        console.agent_action("DataAnalyst", "Deduplicating Findings", f"Checking {len(problems)} problems for duplicates...")
-        deduped = self.cross_validator.deduplicate(problems)
-        removed_count = len(problems) - len(deduped)
-        if removed_count > 0:
-            console.success(f"Deduplicated: removed {removed_count} duplicate(s), {len(deduped)} unique problems remain")
-        self.state.artifacts["discovered_problems"] = deduped
-
-        # Step 2: Cross-validate
-        console.agent_action("DataAnalyst", "Cross-Validating", "Scoring multi-source confirmation...")
-        validated = self.cross_validator.cross_validate(deduped)
-        self.state.artifacts["discovered_problems"] = validated
-
-        # Apply freshness scoring — downweight stale problems before LLM analysis
-        from research.credibility import score_freshness
-        freshness_penalized = 0
-        for p in validated:
-            disc_at = p.get("discovered_at")
-            if isinstance(disc_at, str):
-                try:
-                    disc_at = datetime.fromisoformat(disc_at)
-                except (ValueError, TypeError):
-                    disc_at = None
-            elif not isinstance(disc_at, datetime):
-                disc_at = None
-            freshness = score_freshness(discovered_at=disc_at)
-            p["freshness_score"] = freshness
-            if freshness < 0.8:
-                p["score"] = round(p.get("score", 0.0) * freshness, 4)
-                freshness_penalized += 1
-        if freshness_penalized:
-            console.info(f"Freshness scoring: {freshness_penalized} problem(s) penalized for staleness")
-        else:
-            console.info("Freshness scoring: all problems are recent (no penalty)")
-
-        # Step 2b: LLM-powered cross-validation (DataAnalyst agent)
-        console.agent_action("DataAnalyst", "LLM Cross-Validation", "Agent cross-validating findings with structured verdicts...")
-        cross_val_task = {
-            "type": "cross_validate_research",
-            "findings": validated[:5],  # Top 5 for token efficiency
-            "sources": list({s for p in validated for s in p.get("sources", [])}),
-            "topic": self.state.current_problem.description if self.state.current_problem else "research findings",
-        }
-        cross_val_result = await self.data_analyst.execute_task(cross_val_task)
-        # Track DataAnalyst experience and pool performance
-        if hasattr(self.data_analyst, '_experience'):
-            self.data_analyst._experience.add_experience("cross_validate_research", cross_val_result.success)
-        self.agent_pool.record_task_outcome("DataAnalyst", cross_val_result.success)
-        self.performance_tracker.record_task(
-            "DataAnalyst", success=cross_val_result.success,
-            response_time_ms=cross_val_result.execution_time * 1000, tokens=0
-        )
-        # Reflect on DataAnalyst cross-validation (learning)
-        if self.enable_learning:
-            self.data_analyst.reflect(
-                "cross_validate_research",
-                str(cross_val_result.output),
-                cross_val_result.success
-            )
-        # DataAnalyst shares validation results back to Researcher via message bus
-        self.message_bus.share_finding(
-            "DataAnalyst", "Researcher",
-            f"Cross-validation complete for {len(validated)} findings. See cross_validation_verdicts artifact."
-        )
-
-        # Parse structured verdicts
-        from utils.output_parser import StructuredOutputParser
-        verdict_parser = StructuredOutputParser()
-        cross_val_text = cross_val_result.artifacts.get("cross_validation_report", "")
-        parsed_verdicts = verdict_parser.parse_data_analyst_verdict(cross_val_text)
-        self.state.artifacts["cross_validation_verdicts"] = parsed_verdicts
-
-        summary = parsed_verdicts.get("summary", {})
-        console.info(
-            f"LLM cross-validation: {summary.get('confirmed', 0)} confirmed, "
-            f"{summary.get('partially_confirmed', 0)} partial, "
-            f"{summary.get('unconfirmed', 0)} unconfirmed, "
-            f"{summary.get('contradicted', 0)} contradicted"
-        )
-
-        # Step 3: Detect bias
-        console.agent_action("DataAnalyst", "Detecting Bias", "Checking for systematic research biases...")
-        bias_flags = self.cross_validator.detect_bias(validated)
-        if bias_flags:
-            for flag in bias_flags:
-                console.warning(f"Bias detected: {flag.bias_type.value} ({flag.severity}) - {flag.description}")
-            self.state.artifacts["bias_flags"] = [
-                {"type": bf.bias_type.value, "description": bf.description, "severity": bf.severity}
-                for bf in bias_flags
-            ]
-
-        # Step 3b: Bias-reactive corrections
-        if bias_flags:
-            for flag in bias_flags:
-                flag_data = {"type": getattr(flag.bias_type, 'value', str(flag.bias_type)),
-                             "severity": flag.severity}
-                if flag.severity == "high":
-                    if "community" in flag_data["type"].lower():
-                        # Downweight single-source findings
-                        for p in validated:
-                            sources = p.get("sources", [])
-                            if len(sources) <= 1:
-                                old_score = p.get("score", 0)
-                                p["score"] = old_score * 0.7
-                                console.info(f"Downweighted single-source finding: {p.get('description', '')}")
-                    if "recency" in flag_data["type"].lower():
-                        console.warning("Recency bias detected: all findings from last 7 days. Consider historical context.")
-            self.state.artifacts["discovered_problems"] = validated
-
-        # Step 3b+: Mandatory opposing-viewpoint search when high-severity bias detected
-        high_bias_flags = [f for f in bias_flags if getattr(f, 'severity', '') == "high"]
-        if high_bias_flags and validated:
-            top_desc = validated[0].get("description", "")
-            if top_desc:
-                console.info(
-                    f"High-severity bias detected ({len(high_bias_flags)} flags). "
-                    "Running mandatory opposing-viewpoint search..."
-                )
-                try:
-                    from research.web_search import WebSearch as _WS
-                    _counter_searcher = _WS()
-                    _opposing_queries = [
-                        f"why {top_desc[:70]} is not a real problem",
-                        f"{top_desc[:60]} criticism overhyped",
-                        f"problems with {top_desc[:60]} solution",
-                    ]
-                    _opposing_results = []
-                    for _q in _opposing_queries[:2]:
-                        _res = await _counter_searcher.search_duckduckgo(_q, max_results=3, recency_days=90)
-                        _opposing_results.extend(_res)
-                    if _opposing_results:
-                        self.state.artifacts["opposing_viewpoints"] = [
-                            {"title": r.title, "snippet": r.snippet, "url": r.url}
-                            for r in _opposing_results[:6]
-                        ]
-                        console.info(
-                            f"Opposing viewpoints: {len(_opposing_results)} results found to balance bias"
-                        )
-                except Exception as _e:
-                    console.warning(f"Opposing viewpoint search failed: {_e}")
-
-        # Step 3c: Counter-evidence search for top problems
-        try:
-            problem_objects = []
-            for p in validated[:3]:
-                try:
-                    prob = DiscoveredProblem(
-                        id=p.get("id", ""),
-                        description=p.get("description", ""),
-                        severity=ProblemSeverity(p.get("severity", "medium")),
-                        score=p.get("score", 0.0),
-                        keywords=p.get("keywords", []),
-                        sources=p.get("sources", []),
-                    )
-                    problem_objects.append(prob)
-                except Exception as e:
-                    console.warning(f"Skipping malformed problem in data analysis phase: {e}")
-                    continue
-            if problem_objects:
-                counter_evidence = await self.problem_discoverer.discover_counter_evidence(problem_objects, top_n=3)
-                if counter_evidence:
-                    self.state.artifacts["counter_evidence"] = counter_evidence
-                    for ce in counter_evidence:
-                        if ce.get("counter_evidence"):
-                            console.info(f"Counter-evidence for '{ce['description'][:50]}': {len(ce['counter_evidence'])} items")
-        except Exception as e:
-            console.warning(f"Counter-evidence search failed: {e}")
-
-        # Step 4: Use DataAnalyst agent for LLM-powered credibility scoring
-        console.agent_action("DataAnalyst", "Scoring Credibility", "LLM-powered credibility assessment...")
-        credibility_task = {
-            "type": "score_credibility",
-            "findings": validated[:5],  # Top 5 for LLM analysis (token-efficient)
-            "sources": list({s for p in validated for s in p.get("sources", [])})
-        }
-        cred_result = await self.data_analyst.execute_task(credibility_task)
-        self.state.artifacts["credibility_analysis"] = cred_result.output
-
-        # Re-rank problems by final composite score (bias + freshness adjustments applied)
-        if validated:
-            validated.sort(key=lambda p: p.get("score", 0.0), reverse=True)
-            self.state.artifacts["discovered_problems"] = validated
-            top = validated[0]
-            top_score = top.get("score", 0.0)
-            console.info(f"Final top problem score after full analysis: {top_score:.3f}")
-            # Update current_problem if re-ranking changed which problem is top
-            if self.state.current_problem and top.get("id") != self.state.current_problem.id:
-                console.info(f"Top problem changed after scoring: '{top.get('description', '')[:60]}...'")
-                try:
-                    new_top = DiscoveredProblem(
-                        id=top.get("id", ""),
-                        description=top.get("description", ""),
-                        severity=ProblemSeverity(top.get("severity", "medium")),
-                        score=top_score,
-                        keywords=top.get("keywords", []),
-                        sources=top.get("sources", []),
-                    )
-                    self.state.current_problem = new_top
-                    console.success(f"Current problem updated to highest-scored: {new_top.description[:80]}")
-                except Exception as e:
-                    console.warning(f"Could not update current problem after re-ranking: {e}")
-
-        console.success(f"Data analysis complete: {len(validated)} problems, {len(bias_flags)} bias flags")
 
     # ============================================================
     #  PHASE 6: DESIGN REVIEW
     # ============================================================
 
-    async def _run_design_review_phase(self) -> None:
-        """Quick meeting: CTO + Developer + QA review architecture before coding."""
-        self.state.phase = WorkflowPhase.DESIGN_REVIEW
-        self.structured_logger.info("Design review phase started")
 
-        architecture = self.state.artifacts.get("architecture", {})
-        requirements = self.state.artifacts.get("requirements", {})
-        problem = self.state.current_problem
 
-        if not self.enable_meetings:
-            console.info("Meetings disabled — skipping design review")
-            self.state.artifacts["design_review"] = {"decision": "skipped", "meetings_disabled": True}
-            return
-
-        review_participants = [
-            {
-                "name": "CTO",
-                "role": "Architecture Author",
-                "model": self.model_config.get_model_name("cto")
-            },
-            {
-                "name": "Developer",
-                "role": "Implementation Feasibility",
-                "model": self.model_config.get_model_name("developer")
-            },
-            {
-                "name": "QAEngineer",
-                "role": "Testability Review",
-                "model": self.model_config.get_model_name("qa_engineer")
-            }
-        ]
-
-        review_context = f"""
-Problem: {problem.description if problem else 'N/A'}
-Architecture: {str(architecture)}
-Requirements: {str(requirements)}
-
-Review this architecture BEFORE implementation begins. Focus on:
-1. Is the design implementable with available resources?
-2. Are there obvious design flaws or missing components?
-3. Is the design testable? Can QA validate it effectively?
-4. Are there simpler alternatives that achieve the same goal?
-"""
-        review_outcome = await quick_meeting(
-            topic="Design Review: Architecture Feasibility Check",
-            participants=review_participants,
-            meeting_type=MeetingType.REVIEW,
-            context=review_context
-        )
-
-        self.state.artifacts["design_review"] = {
-            "decision": review_outcome.decision,
-            "votes": review_outcome.votes,
-            "action_items": review_outcome.action_items
-        }
-
-        if review_outcome.decision == "needs_revision":
-            console.warning("Design review flagged issues. CTO revising architecture...")
-            # CTO revises based on feedback
-            revise_task = {
-                "type": "design_architecture",
-                "problem": problem.to_dict() if problem else {},
-                "requirements": str(requirements),
-                "constraint": f"Design review feedback: {'; '.join(review_outcome.action_items[:3])}. Address these concerns."
-            }
-            revised = await self.cto.execute_task(revise_task)
-            self.state.artifacts["architecture"] = revised.output
-            console.success("Architecture revised based on design review feedback")
-        else:
-            console.success("Design review passed")
-
-    async def _run_security_review_phase(self) -> bool:
-        """Security Engineer reviews the solution code for vulnerabilities."""
-        self.state.phase = WorkflowPhase.SECURITY_REVIEW
-        self.structured_logger.info("Security review phase started")
-
-        implementation = self.state.artifacts.get("implementation", {})
-        project_dir = self.state.artifacts.get("project_name", self.output_dir)
-
-        # Collect code files for review
-        files = {}
-        project_path = Path(project_dir)
-        if project_path.exists():
-            py_files = self._filter_project_files(list(project_path.rglob("*.py")))
-            for f in py_files[:10]:  # Limit to 10 files for token efficiency
-                try:
-                    files[str(f.relative_to(project_path))] = f.read_text()
-                except Exception:
-                    pass
-
-        # Security review
-        console.agent_action("SecurityEngineer", "Security Review", f"Reviewing {len(files)} files...")
-        review_task = {
-            "type": "security_review",
-            "code": str(implementation),
-            "files": files,
-            "file_path": project_dir,
-            "context": f"Problem: {self.state.current_problem.description if self.state.current_problem else 'N/A'}"
-        }
-        review_result = await self.security_engineer.execute_task(review_task)
-        self.state.artifacts["security_review"] = review_result.output
-        # Track SecurityEngineer experience and pool performance
-        if hasattr(self.security_engineer, '_experience'):
-            self.security_engineer._experience.add_experience("security_review", review_result.success)
-        self.agent_pool.record_task_outcome("SecurityEngineer", review_result.success)
-        self.performance_tracker.record_task(
-            "SecurityEngineer", success=review_result.success,
-            response_time_ms=review_result.execution_time * 1000, tokens=0
-        )
-        # Reflect on Security review (learning)
-        if self.enable_learning:
-            self.security_engineer.reflect(
-                "security_review",
-                str(review_result.output),
-                review_result.success
-            )
-
-        # Parse verdict
-        output = review_result.output if isinstance(review_result.output, dict) else {}
-        verdict = output.get("verdict", "has_issues")
-        critical_count = output.get("critical_count", 0)
-
-        console.info(f"Security verdict: {verdict.upper()}, {critical_count} critical vulnerabilities")
-
-        if verdict == "critical_vulnerabilities":
-            console.error("Critical security vulnerabilities found! Must be fixed before deployment.")
-            # Feed security issues to Developer for fixing
-            project_dir = self.state.artifacts.get("project_name", self.output_dir)
-            sec_fix_task = {
-                "type": "fix_bug",
-                "bug_description": f"Critical security vulnerabilities found. Fix these: {output.get('review', '')}",
-                "error_message": "",
-                "qa_report": "",
-                "original_requirements": str(self.state.artifacts.get("requirements", "")),
-                "output_dir": project_dir
-            }
-            fix_result = await self.developer.execute_task(sec_fix_task)
-            self.state.artifacts["security_fix"] = fix_result.output
-            console.success("Developer applied security fixes")
-
-            # Re-run security review
-            review_result = await self.security_engineer.execute_task(review_task)
-            self.state.artifacts["security_review"] = review_result.output
-            output = review_result.output if isinstance(review_result.output, dict) else {}
-            verdict = output.get("verdict", "has_issues")
-            if verdict == "critical_vulnerabilities":
-                return False  # Still has critical issues
-            console.success("Security issues resolved after fix")
-
-        return verdict != "critical_vulnerabilities"
-
-    async def _run_retrospective_phase(self) -> None:
-        """All agents reflect on the workflow run - what worked, what didn't, what to improve."""
-        self.state.phase = WorkflowPhase.RETROSPECTIVE
-        self.structured_logger.info("Retrospective phase started")
-
-        if not self.enable_meetings:
-            console.info("Meetings disabled — skipping retrospective")
-            self.state.artifacts["retrospective"] = {"decision": "skipped", "meetings_disabled": True}
-            return
-
-        # Gather workflow summary for context
-        status = self.state.phase.value
-        duration = None
-        if self.state.started_at:
-            duration = (datetime.now() - self.state.started_at).total_seconds()
-
-        duration_str = f"{duration:.0f}s" if duration else "N/A"
-        retro_context = f"""
-Workflow Status: {status}
-Duration: {duration_str}
-Problem: {self.state.current_problem.description if self.state.current_problem else 'N/A'}
-Decisions Made: {len(self.state.decisions)}
-Phases Completed: {', '.join(k for k, v in self.state.artifacts.items() if v)}
-Error: {self.state.error or 'None'}
-"""
-
-        retro_participants = [
-            {"name": "CEO", "role": "Strategic Leadership", "model": self.model_config.get_model_name("ceo")},
-            {"name": "CTO", "role": "Technical Leadership", "model": self.model_config.get_model_name("cto")},
-            {"name": "ProductManager", "role": "Product Strategy", "model": self.model_config.get_model_name("product_manager")},
-            {"name": "Developer", "role": "Implementation", "model": self.model_config.get_model_name("developer")},
-        ]
-
-        retro_outcome = await quick_meeting(
-            topic="Workflow Retrospective: What worked, what didn't, what to improve?",
-            participants=retro_participants,
-            meeting_type=MeetingType.RETROSPECTIVE,
-            context=retro_context
-        )
-
-        self.state.artifacts["retrospective"] = {
-            "decision": retro_outcome.decision,
-            "key_insights": retro_outcome.key_insights,
-            "action_items": retro_outcome.action_items
-        }
-
-        # Store learnings in shared memory
-        self.shared_memory.store_meeting(
-            topic="Workflow Retrospective",
-            participants=[p["name"] for p in retro_participants],
-            summary=retro_outcome.decision,
-            action_items=retro_outcome.action_items
-        )
-
-        # Activate learning system analysis for each agent
-        from memory.shared_memory import MemoryType
-        for agent_name, agent in self.agents.items():
-            if hasattr(agent, 'learning'):
-                perf_analysis = agent.learning.analyze_performance()
-                if perf_analysis.get("status") != "no_data":
-                    suggestions = agent.learning.get_improvement_suggestions()
-                    if suggestions:
-                        summary = agent.learning.export_learning_summary()
-                        console.info(
-                            f"Learning: {agent_name} — "
-                            f"{perf_analysis.get('total_lessons', 0)} lessons, "
-                            f"{perf_analysis.get('success_rate', 0):.0%} success"
-                        )
-                        self.shared_memory.store(
-                            content=f"Learning for {agent_name}: {summary}",
-                            memory_type=MemoryType.INSIGHT,
-                            created_by=agent_name,
-                            tags=["learning", "retrospective", agent_name],
-                            importance=0.6,
-                        )
-
-        console.success(f"Retrospective complete: {len(retro_outcome.key_insights)} insights, {len(retro_outcome.action_items)} action items")
-
-        # HR review: fire underperformers, log hiring needs
-        underperformers = self.agent_pool.get_underperformers(threshold=0.3, min_tasks=3)
-        for under in underperformers:
-            self.agent_pool.fire_agent(
-                under.name,
-                reason=(
-                    f"Performance score {under.performance_score:.0%} "
-                    f"({under.tasks_failed} failures / {under.tasks_completed + under.tasks_failed} tasks) "
-                    "below 30% threshold after retrospective review"
-                )
-            )
-            # Log hiring need to backfill the role
-            self.agent_pool.hire_agent(
-                under.role,
-                reason=f"Backfill after {under.name} termination — maintaining team capacity"
-            )
-        if underperformers:
-            console.info(
-                f"HR action: {len(underperformers)} agent(s) terminated and backfilled"
-            )
-
-        # Persist action items as next-run constraints in strategy memory
-        action_items = retro_outcome.action_items if retro_outcome.action_items else []
-        if action_items:
-            constraints_text = "RETROSPECTIVE CONSTRAINTS (from last run): " + "; ".join(str(a) for a in action_items[:5])
-            problem_key = (
-                self.state.current_problem.description[:80]
-                if self.state.current_problem else "general"
-            )
-            self.escalation_manager.strategy_memory.record_attempt(
-                problem=problem_key,
-                approach="retrospective_constraints",
-                outcome="action_items",
-                details=constraints_text,
-                success=True
-            )
-            console.info(f"Stored {len(action_items)} retrospective action items as next-run constraints")
-
-        # Write structured session summary JSON to disk for cross-run learning
-        import json as _json
-        summary_path = Path(self.data_dir) / "session_summary.json"
-        session_summary = {
-            "timestamp": datetime.now().isoformat(),
-            "problem": self.state.current_problem.description if self.state.current_problem else "N/A",
-            "duration_s": duration,
-            "phases_completed": list(self.state.artifacts.keys()),
-            "decisions": self.state.decisions[-20:],  # last 20 decisions
-            "action_items": action_items,
-            "key_insights": retro_outcome.key_insights if retro_outcome.key_insights else [],
-            "error": self.state.error,
-        }
-        try:
-            summary_path.write_text(_json.dumps(session_summary, indent=2, default=str))
-            console.info(f"Session summary saved → {summary_path}")
-        except Exception as _e:
-            console.warning(f"Could not save session summary: {_e}")
 
     def _save_checkpoint(self) -> None:
         """Save workflow state checkpoint after each phase."""
@@ -4246,34 +2264,6 @@ Error: {self.state.error or 'None'}
     #  INTERACTIVE APPROVAL
     # ============================================================
 
-    def _interactive_gate(self, phase_name: str, details: str = "") -> bool:
-        """Pause for user approval in interactive mode. Returns True to continue, False to abort."""
-        if not getattr(self, '_interactive', False):
-            return True
-
-        from ui.interactive import AskUserQuestion, QuestionType
-
-        asker = AskUserQuestion(color_enabled=True)
-        prompt = f"Phase complete: {phase_name}"
-        if details:
-            prompt += f"\n{details}"
-        prompt += "\nContinue to next phase?"
-
-        result = asker.ask(
-            question=prompt,
-            question_type=QuestionType.YES_NO,
-            header="Approval",
-            default="y",
-        )
-
-        if result.skipped or result.timed_out:
-            return False
-
-        if not result.answer:
-            console.warning("Workflow aborted by user")
-            return False
-
-        return True
 
     # ============================================================
     #  COMPLETION SUMMARY
@@ -4402,16 +2392,6 @@ Error: {self.state.error or 'None'}
     # Suffixes that mark directories to skip (e.g., package.egg-info)
     _IGNORED_SUFFIXES = (".egg-info",)
 
-    def _filter_project_files(self, files: list) -> list:
-        """Filter out files inside ignored directories."""
-        return [
-            f for f in files
-            if not any(
-                part in self._IGNORED_DIRS
-                or part.endswith(self._IGNORED_SUFFIXES)
-                for part in f.parts
-            )
-        ]
 
     # ============================================================
     #  PHASE 8: CODE EXECUTION
@@ -4827,3 +2807,84 @@ Error: {self.state.error or 'None'}
         console.info(f"Successful: {completed}/{len(results)}")
 
         return results
+
+    async def _run_research_phase(self, *args, **kwargs):
+        return await _run_research_phase(self, *args, **kwargs)
+
+    async def _discover_from_web_search(self, *args, **kwargs):
+        return await _discover_from_web_search(self, *args, **kwargs)
+
+    async def _run_data_analysis_phase(self, *args, **kwargs):
+        return await _run_data_analysis_phase(self, *args, **kwargs)
+
+    async def _run_analysis_phase(self, *args, **kwargs):
+        return await _run_analysis_phase(self, *args, **kwargs)
+
+    async def _run_opportunity_evaluation(self, *args, **kwargs):
+        return await _run_opportunity_evaluation(self, *args, **kwargs)
+
+    async def _run_technical_design_phase(self, *args, **kwargs):
+        return await _run_technical_design_phase(self, *args, **kwargs)
+
+    async def _run_design_review_phase(self, *args, **kwargs):
+        return await _run_design_review_phase(self, *args, **kwargs)
+
+    async def _run_implementation_phase(self, *args, **kwargs):
+        return await _run_implementation_phase(self, *args, **kwargs)
+
+    async def _run_qa_phase(self, *args, **kwargs):
+        return await _run_qa_phase(self, *args, **kwargs)
+
+    async def _run_security_review_phase(self, *args, **kwargs):
+        return await _run_security_review_phase(self, *args, **kwargs)
+
+    async def _check_quality_gate(self, *args, **kwargs):
+        return await _check_quality_gate(self, *args, **kwargs)
+
+    def _evaluate_gate(self, *args, **kwargs):
+        return _evaluate_gate(self, *args, **kwargs)
+
+    async def _retry_gate(self, *args, **kwargs):
+        return await _retry_gate(self, *args, **kwargs)
+
+    async def _run_ceo_approval(self, *args, **kwargs):
+        return await _run_ceo_approval(self, *args, **kwargs)
+
+    async def _run_delivery_phase(self, *args, **kwargs):
+        return await _run_delivery_phase(self, *args, **kwargs)
+
+    async def _run_retrospective_phase(self, *args, **kwargs):
+        return await _run_retrospective_phase(self, *args, **kwargs)
+
+    async def _team_brainstorm(self, *args, **kwargs):
+        return await _team_brainstorm(self, *args, **kwargs)
+
+    async def _decompose_problem(self, *args, **kwargs):
+        return await _decompose_problem(self, *args, **kwargs)
+
+    async def _pivot_approach(self, *args, **kwargs):
+        return await _pivot_approach(self, *args, **kwargs)
+
+    def _check_token_budget(self, *args, **kwargs):
+        return _check_token_budget(self, *args, **kwargs)
+
+    def _get_time_context(self, *args, **kwargs):
+        return _get_time_context(self, *args, **kwargs)
+
+    def _detect_failure_owner(self, *args, **kwargs):
+        return _detect_failure_owner(self, *args, **kwargs)
+
+    def _adjust_agent_behavior(self, *args, **kwargs):
+        return _adjust_agent_behavior(self, *args, **kwargs)
+
+    def _drain_messages_for_agent(self, *args, **kwargs):
+        return _drain_messages_for_agent(self, *args, **kwargs)
+
+    def _load_previous_learnings(self, *args, **kwargs):
+        return _load_previous_learnings(self, *args, **kwargs)
+
+    def _filter_project_files(self, *args, **kwargs):
+        return _filter_project_files(self, *args, **kwargs)
+
+    def _interactive_gate(self, *args, **kwargs):
+        return _interactive_gate(self, *args, **kwargs)

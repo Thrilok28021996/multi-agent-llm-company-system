@@ -113,8 +113,6 @@ class ConsistencyChecker:
             self.errors.append("❌ Could not find WorkflowPhase enum")
             return False
         
-        enum_values = re.findall(r'= "(.*?)"', enum_section.group(0))
-        
         # Extract progress.add_phases() calls
         phase_patterns = re.findall(
             r'\{"id": "([^"]+)", "name"',
@@ -155,10 +153,8 @@ class ConsistencyChecker:
         """Verify config_loader model defaults match models.py."""
         print("🔍 Checking model defaults synchronization...")
         
-        models_file = Path("config/models.py")
         config_file = Path("config/config_loader.py")
         
-        models_content = models_file.read_text()
         config_content = config_file.read_text()
         
         # Check for stale defaults
@@ -184,8 +180,6 @@ class ConsistencyChecker:
     def check_no_stale_references(self) -> bool:
         """Scan for stale naming patterns."""
         print("🔍 Checking for stale naming references...")
-        
-        issues = []
         
         # Check orchestrator/workflow.py for old phase names in method calls
         workflow = Path("orchestrator/workflow.py").read_text()
